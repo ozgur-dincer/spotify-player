@@ -36,6 +36,14 @@ pub struct State {
     #[cfg(feature = "streaming")]
     pub vis_bands: Option<Arc<Mutex<crate::ui::streaming::VisBands>>>,
 
+    /// The integrated device's volume (librespot's 0-65535 scale), as last set
+    /// intentionally by this application (either at connection time or via a
+    /// user-issued `PlayerRequest::Volume`/`ToggleMute`). Used to detect and
+    /// revert unsolicited remote Spotify Connect volume commands (e.g. issued
+    /// by another device signed into the same account).
+    #[cfg(feature = "streaming")]
+    pub expected_volume: Mutex<Option<u16>>,
+
     pub logs: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -64,6 +72,8 @@ impl State {
             } else {
                 None
             },
+            #[cfg(feature = "streaming")]
+            expected_volume: Mutex::new(None),
 
             logs: log_buffer,
         }

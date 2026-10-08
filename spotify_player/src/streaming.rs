@@ -94,6 +94,16 @@ impl PlayerEvent {
     }
 }
 
+/// Converts a percentage volume value (0-100) into `librespot`'s internal volume scale (0-65535).
+pub fn percent_to_volume(percent: u8) -> u16 {
+    (f64::from(std::cmp::min(percent, 100_u8)) / 100.0 * 65535.0).round() as u16
+}
+
+/// Converts a `librespot`-scale volume value (0-65535) back into a percentage (0-100).
+fn volume_to_percent(volume: u16) -> u8 {
+    (f64::from(volume) / 65535.0 * 100.0).round() as u8
+}
+
 fn spotify_id_to_playable_id(uri: &spotify_uri::SpotifyUri) -> anyhow::Result<PlayableId<'static>> {
     match uri {
         SpotifyUri::Track { .. } => {
@@ -153,14 +163,20 @@ pub async fn new_connection(
     state: SharedState,
     session: Session,
     creds: Credentials,
-) -> anyhow::Result<Spirc> {
+) -> anyhow::Result<Arc<Spirc>> {
     let configs = config::get_config();
     let device = &configs.app_config.device;
 
     // `librespot` volume is a u16 number ranging from 0 to 65535,
     // while a percentage volume value (from 0 to 100) is used for the device configuration.
     // So we need to convert from one format to another
-    let volume = (f64::from(std::cmp::min(device.volume, 100_u8)) / 100.0 * 65535.0).round() as u16;
+    let volume = percent_to_volume(device.volume);
+
+    // Establish our own baseline for this connection's volume so that any later
+    // `VolumeChanged` event that doesn't match a value we intentionally set can be
+    // recognized as an unsolicited remote Spotify Connect command (see the
+    // `player_event_task` below).
+    *state.expected_volume.lock() = Some(volume);
 
     let connect_config = ConnectConfig {
         name: device.name.clone(),
@@ -222,14 +238,27 @@ pub async fn new_connection(
         )
     };
 
+    let player_event_channel = player.get_player_event_channel();
+
     // When `pause_on_startup` is enabled, suppress Spotify's auto-resume of the
     // previous session by pausing the first auto-started playback. Scoped to the
     // first connection of the process so mid-session reconnects are unaffected.
     let pause_on_startup =
         configs.app_config.pause_on_startup && IS_FIRST_CONNECTION.swap(false, Ordering::SeqCst);
 
+    tracing::info!("Starting an integrated Spotify player using librespot's spirc protocol");
+
+    // Created before spawning the player event task below so that the task can hold
+    // a handle to `spirc` and revert unsolicited remote volume commands (see the
+    // `VolumeChanged` handling below).
+    let (spirc, spirc_task) = Spirc::new(connect_config, session, creds, player, mixer)
+        .await
+        .context("initialize spirc")?;
+    let spirc = Arc::new(spirc);
+
     let player_event_task = tokio::task::spawn({
-        let mut channel = player.get_player_event_channel();
+        let mut channel = player_event_channel;
+        let spirc = Arc::clone(&spirc);
         async move {
             let mut pause_armed = pause_on_startup;
             while let Some(event) = channel.recv().await {
@@ -259,6 +288,47 @@ pub async fn new_connection(
                             pause_armed = false;
                         }
                         _ => {}
+                    }
+                }
+
+                // Detect and revert unsolicited remote Spotify Connect volume commands.
+                //
+                // `librespot` applies a remote `SetVolumeCommand` (issued by *any*
+                // device signed into the account, e.g. a TV or phone) to the mixer
+                // before this event is observable, so it cannot be blocked
+                // pre-emptively. Instead, we compare the reported volume against the
+                // last volume this app intentionally set (`state.expected_volume`,
+                // updated on connect and on local `PlayerRequest::Volume`/`ToggleMute`
+                // requests). A mismatch means some other device changed our volume;
+                // we revert it and log the event so it's visible/confirmable.
+                if let player::PlayerEvent::VolumeChanged { volume: reported } = &event {
+                    let reported = *reported;
+                    let mut expected = state.expected_volume.lock();
+                    match *expected {
+                        Some(exp)
+                            if volume_to_percent(exp).abs_diff(volume_to_percent(reported))
+                                <= 1 => {}
+                        Some(exp) => {
+                            tracing::warn!(
+                                "Detected an unsolicited remote volume change via Spotify Connect \
+                                 ({}% -> {}%); ignoring it and reverting to {}%",
+                                volume_to_percent(exp),
+                                volume_to_percent(reported),
+                                volume_to_percent(exp)
+                            );
+                            match spirc.set_volume(exp) {
+                                Ok(()) => tracing::info!(
+                                    "Reverted volume back to {}% after an unsolicited remote change",
+                                    volume_to_percent(exp)
+                                ),
+                                Err(err) => tracing::warn!(
+                                    "Failed to revert an unsolicited remote volume change: {err:#}"
+                                ),
+                            }
+                        }
+                        None => {
+                            *expected = Some(reported);
+                        }
                     }
                 }
 
@@ -305,12 +375,6 @@ pub async fn new_connection(
             }
         }
     });
-
-    tracing::info!("Starting an integrated Spotify player using librespot's spirc protocol");
-
-    let (spirc, spirc_task) = Spirc::new(connect_config, session, creds, player, mixer)
-        .await
-        .context("initialize spirc")?;
 
     tokio::task::spawn(async move {
         tokio::select! {

@@ -77,7 +77,7 @@ pub struct AppClient {
     /// The Spotify Web API client, used for interacting with Spotify Web APIs
     api_client: WebApiClient,
     #[cfg(feature = "streaming")]
-    stream_conn: Arc<Mutex<Option<librespot_connect::Spirc>>>,
+    stream_conn: Arc<Mutex<Option<Arc<librespot_connect::Spirc>>>>,
 }
 
 impl Deref for AppClient {
@@ -357,11 +357,31 @@ impl AppClient {
         }
     }
 
+    /// Records a volume change intentionally requested by this application (via
+    /// `PlayerRequest::Volume`/`ToggleMute`) as the expected baseline volume for the
+    /// integrated streaming device, so that a later mismatching `VolumeChanged`
+    /// event is recognized as an unsolicited remote Spotify Connect command rather
+    /// than our own request being echoed back.
+    #[cfg(feature = "streaming")]
+    fn note_own_volume_change(state: Option<&SharedState>, volume_percent: u8) {
+        if let Some(state) = state {
+            *state.expected_volume.lock() =
+                Some(crate::streaming::percent_to_volume(volume_percent));
+        }
+    }
+
     /// Handle a player request, return a new playback metadata on success
+    ///
+    /// `state`, when available, is used to record the volume this app intentionally
+    /// requests (see `PlayerRequest::Volume`/`ToggleMute` below) so that unsolicited
+    /// remote Spotify Connect volume changes can be detected and reverted.
     pub async fn handle_player_request(
         &self,
         request: PlayerRequest,
         mut playback: Option<PlaybackMetadata>,
+        #[cfg_attr(not(feature = "streaming"), allow(unused_variables))] state: Option<
+            &SharedState,
+        >,
     ) -> Result<Option<PlaybackMetadata>> {
         // handle requests that don't require an active playback
         match request {
@@ -437,6 +457,8 @@ impl AppClient {
             }
             PlayerRequest::Volume(volume) => {
                 self.volume(volume, device_id).await?;
+                #[cfg(feature = "streaming")]
+                Self::note_own_volume_change(state, volume);
 
                 playback.volume = Some(u32::from(volume));
                 playback.mute_state = None;
@@ -445,10 +467,14 @@ impl AppClient {
                 let new_mute_state = match playback.mute_state {
                     None => {
                         self.volume(0, device_id).await?;
+                        #[cfg(feature = "streaming")]
+                        Self::note_own_volume_change(state, 0);
                         Some(playback.volume.unwrap_or_default())
                     }
                     Some(volume) => {
                         self.volume(volume as u8, device_id).await?;
+                        #[cfg(feature = "streaming")]
+                        Self::note_own_volume_change(state, volume as u8);
                         None
                     }
                 };
@@ -510,7 +536,9 @@ impl AppClient {
             }
             ClientRequest::Player(request) => {
                 let playback = state.player.read().buffered_playback.clone();
-                let playback = self.handle_player_request(request, playback).await?;
+                let playback = self
+                    .handle_player_request(request, playback, Some(state))
+                    .await?;
                 state.player.write().buffered_playback = playback;
                 self.update_playback_non_blocking(state);
             }

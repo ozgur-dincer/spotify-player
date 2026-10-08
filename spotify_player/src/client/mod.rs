@@ -76,6 +76,7 @@ pub struct AppClient {
     auth_config: AuthConfig,
     /// The Spotify Web API client, used for interacting with Spotify Web APIs
     api_client: WebApiClient,
+    session_reconnect: Arc<tokio::sync::Mutex<()>>,
     #[cfg(feature = "streaming")]
     stream_conn: Arc<Mutex<Option<Arc<librespot_connect::Spirc>>>>,
 }
@@ -177,6 +178,7 @@ impl AppClient {
             http: reqwest::Client::new(),
             auth_config,
             api_client,
+            session_reconnect: Arc::new(tokio::sync::Mutex::new(())),
 
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(Mutex::new(None)),
@@ -205,10 +207,20 @@ impl AppClient {
                         return;
                     }
 
-                    // if playback exists, don't connect to a new device
-                    if state.player.read().playback.is_some() {
+                    let has_playback = state.player.read().playback.is_some();
+                    #[cfg(feature = "streaming")]
+                    let has_playback = if state.is_streaming_enabled() {
+                        let session = client.spotify.session().await;
+                        state.player.read().playback.as_ref().is_some_and(|p| {
+                            p.device.is_active
+                                && p.device.id.as_deref() == Some(session.device_id())
+                        })
+                    } else {
+                        has_playback
+                    };
+                    if has_playback {
                         tracing::info!("Playback already exists, skipping device connection.");
-                        continue;
+                        break;
                     }
 
                     let id = match client.find_available_device(&state).await {
@@ -309,6 +321,7 @@ impl AppClient {
 
     /// Check if the current session is valid and if invalid, create a new session
     pub async fn check_valid_session(&self, state: &SharedState) -> Result<()> {
+        let _reconnect = self.session_reconnect.lock().await;
         if self.spotify.session().await.is_invalid() {
             tracing::info!("Client's current session is invalid, creating a new session...");
             self.new_session(Some(state), false)
@@ -372,9 +385,8 @@ impl AppClient {
 
     /// Handle a player request, return a new playback metadata on success
     ///
-    /// `state`, when available, is used to record the volume this app intentionally
-    /// requests (see `PlayerRequest::Volume`/`ToggleMute` below) so that unsolicited
-    /// remote Spotify Connect volume changes can be detected and reverted.
+    /// `state` enables recovery through this instance's integrated player and records
+    /// intentional volume changes for the remote-volume guard.
     pub async fn handle_player_request(
         &self,
         request: PlayerRequest,
@@ -383,6 +395,27 @@ impl AppClient {
             &SharedState,
         >,
     ) -> Result<Option<PlaybackMetadata>> {
+        let mut recovery_device = None;
+        if playback.is_none()
+            && matches!(
+                request,
+                PlayerRequest::Resume
+                    | PlayerRequest::ResumePause
+                    | PlayerRequest::StartPlayback(..)
+            )
+        {
+            let device_id = self.integrated_device_id(state).await?;
+            playback = self
+                .current_playback2()
+                .await?
+                .filter(|p| {
+                    p.device.is_active && p.device.id.as_deref() == Some(device_id.as_str())
+                })
+                .as_ref()
+                .map(PlaybackMetadata::from_playback);
+            recovery_device = Some(device_id);
+        }
+
         // handle requests that don't require an active playback
         match request {
             PlayerRequest::TransferPlayback(device_id, force_play) => {
@@ -397,13 +430,34 @@ impl AppClient {
                 if let (Some(shuffle), Some(playback)) = (shuffle, playback.as_mut()) {
                     playback.shuffle_state = shuffle;
                 }
-                let device_id = playback.as_ref().and_then(|p| p.device_id.as_deref());
+                if playback.is_none() {
+                    self.activate_integrated_device(
+                        recovery_device
+                            .as_deref()
+                            .context("no integrated recovery device")?,
+                    )
+                    .await?;
+                }
+                let device_id = playback
+                    .as_ref()
+                    .and_then(|p| p.device_id.as_deref())
+                    .or(recovery_device.as_deref());
                 self.start_playback(p, device_id).await?;
                 // For some reasons, when starting a new playback, the integrated `spotify_player`
                 // client doesn't respect the initial shuffle state, so we need to manually update the state
                 if let Some(ref playback) = playback {
                     self.shuffle(playback.shuffle_state, device_id).await?;
                 }
+                return Ok(None);
+            }
+            PlayerRequest::Resume | PlayerRequest::ResumePause if playback.is_none() => {
+                let device_id = recovery_device
+                    .as_deref()
+                    .context("no integrated recovery device")?;
+                self.activate_integrated_device(device_id).await?;
+                self.resume_playback(Some(device_id), None)
+                    .await
+                    .context("resume playback on the recovered device")?;
                 return Ok(None);
             }
             _ => {}
@@ -848,9 +902,37 @@ impl AppClient {
             .collect())
     }
 
+    #[cfg_attr(
+        not(feature = "streaming"),
+        allow(unused_variables, clippy::unused_async)
+    )]
+    async fn integrated_device_id(&self, state: Option<&SharedState>) -> Result<String> {
+        #[cfg(feature = "streaming")]
+        if let Some(state) = state.filter(|state| state.is_streaming_enabled()) {
+            self.check_valid_session(state).await?;
+            return Ok(self.spotify.session().await.device_id().to_string());
+        }
+        anyhow::bail!(
+            "automatic playback recovery requires a running integrated player; enable streaming"
+        );
+    }
+
+    async fn activate_integrated_device(&self, device_id: &str) -> Result<()> {
+        self.transfer_playback(device_id, Some(false))
+            .await
+            .context("reactivate the integrated Spotify device")?;
+        tracing::info!(%device_id, "Reactivated integrated device to recover missing playback");
+        Ok(())
+    }
+
     /// Find an available device. If found, return the device's ID.
     #[cfg_attr(not(feature = "streaming"), allow(unused_variables))]
     async fn find_available_device(&self, state: &SharedState) -> Result<Option<String>> {
+        #[cfg(feature = "streaming")]
+        if state.is_streaming_enabled() {
+            return Ok(Some(self.spotify.session().await.device_id().to_string()));
+        }
+
         let devices = self.available_devices().await?;
 
         // if there is an active device, return it
@@ -858,16 +940,10 @@ impl AppClient {
             return Ok(d.id.clone());
         }
 
-        #[allow(unused_mut)]
         let mut devices = devices
             .into_iter()
             .filter_map(Device::try_from_device)
             .collect::<Vec<_>>();
-
-        #[cfg(feature = "streaming")]
-        if state.is_streaming_enabled() {
-            self.ensure_integrated_device(&mut devices).await;
-        }
 
         tracing::info!("no active device found, available devices: {devices:?}");
 
@@ -2073,9 +2149,299 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
-    use super::{move_seed_track_to_front, parse_current_playback_response};
-    use crate::state::Track;
-    use rspotify::model::{PlayableItem, TrackId};
+    use super::{
+        move_seed_track_to_front, parse_current_playback_response, spotify, AppClient,
+        PlayerRequest, WebApiClient,
+    };
+    #[cfg(feature = "streaming")]
+    use crate::state::{Playback, SharedState, State};
+    use crate::{auth::AuthConfig, state::Track};
+    use rspotify::{
+        clients::BaseClient,
+        model::{PlayableItem, TrackId},
+        AuthCodePkceSpotify, Config, Credentials, OAuth, Token,
+    };
+    use std::sync::Arc;
+    #[cfg(feature = "streaming")]
+    use wiremock::matchers::{body_json, query_param};
+    use wiremock::MockServer;
+    #[cfg(feature = "streaming")]
+    use wiremock::{
+        matchers::{method, path},
+        Mock, ResponseTemplate,
+    };
+
+    async fn playback_client(server: &MockServer) -> AppClient {
+        let api_client = AuthCodePkceSpotify::with_config(
+            Credentials::new_pkce("test-client"),
+            OAuth::default(),
+            Config {
+                api_base_url: format!("{}/v1", server.uri()),
+                ..Default::default()
+            },
+        );
+        *api_client.get_token().lock().await.unwrap() = Some(Token {
+            access_token: "test-token".to_string(),
+            expires_in: chrono::Duration::hours(1),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..Default::default()
+        });
+        AppClient {
+            http: reqwest::Client::new(),
+            spotify: Arc::new(spotify::Spotify::new()),
+            auth_config: AuthConfig::default(),
+            api_client: WebApiClient::new(api_client, None),
+            session_reconnect: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(feature = "streaming")]
+            stream_conn: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    #[cfg(feature = "streaming")]
+    #[allow(clippy::default_trait_access)]
+    async fn integrated_state(client: &AppClient) -> SharedState {
+        static CONFIG: std::sync::Once = std::sync::Once::new();
+        CONFIG.call_once(|| {
+            crate::config::set_config(crate::config::Configs {
+                app_config: crate::config::AppConfig::default(),
+                keymap_config: Default::default(),
+                theme_config: Default::default(),
+                cache_folder: std::env::temp_dir()
+                    .join(format!("spotify-player-tests-{}", std::process::id())),
+            });
+        });
+        client
+            .spotify
+            .set_session(librespot_core::Session::new(
+                librespot_core::config::SessionConfig {
+                    device_id: "integrated".to_string(),
+                    ..Default::default()
+                },
+                None,
+            ))
+            .await;
+        Arc::new(State::new(
+            false,
+            Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+        ))
+    }
+
+    #[cfg(feature = "streaming")]
+    async fn mock_missing_playback(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "devices": [device("other-active-player", true)]
+            })))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    #[cfg(feature = "streaming")]
+    fn device(id: &str, active: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "is_active": active, "is_private_session": false,
+            "is_restricted": false, "name": id, "type": "Computer", "volume_percent": 50
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn automatic_device_selection_uses_integrated_without_listing_other_devices() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        assert_eq!(
+            client
+                .find_available_device(&state)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("integrated")
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn missing_playback_commands_reactivate_only_integrated_device() {
+        let track = TrackId::from_id("3n3Ppam7vgaVa1iaRUc9Lp").unwrap();
+        for request in [
+            PlayerRequest::Resume,
+            PlayerRequest::ResumePause,
+            PlayerRequest::StartPlayback(Playback::URIs(vec![track.clone().into()], None), None),
+        ] {
+            let server = MockServer::start().await;
+            let client = playback_client(&server).await;
+            let state = integrated_state(&client).await;
+            mock_missing_playback(&server).await;
+            Mock::given(method("PUT"))
+                .and(path("/v1/me/player"))
+                .and(body_json(
+                    serde_json::json!({"device_ids": ["integrated"], "play": false}),
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/v1/me/player/play"))
+                .and(query_param("device_id", "integrated"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let starts_track = matches!(request, PlayerRequest::StartPlayback(..));
+            assert!(client
+                .handle_player_request(request, None, Some(&state))
+                .await
+                .unwrap()
+                .is_none());
+            if starts_track {
+                let requests = server.received_requests().await.unwrap();
+                let play = requests
+                    .iter()
+                    .find(|request| request.url.path() == "/v1/me/player/play")
+                    .unwrap();
+                assert_eq!(
+                    play.body_json::<serde_json::Value>().unwrap(),
+                    serde_json::json!({"uris": ["spotify:track:3n3Ppam7vgaVa1iaRUc9Lp"]})
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn recovery_reactivates_integrated_even_when_another_device_is_playing() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device": device("other-player", true), "repeat_state": "off",
+                "shuffle_state": false, "context": null, "timestamp": 0,
+                "progress_ms": 1000, "is_playing": true, "item": null,
+                "currently_playing_type": "track", "actions": {"disallows": {}}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player"))
+            .and(body_json(
+                serde_json::json!({"device_ids": ["integrated"], "play": false}),
+            ))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player/play"))
+            .and(query_param("device_id", "integrated"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        client
+            .handle_player_request(PlayerRequest::ResumePause, None, Some(&state))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn missing_cached_playback_refreshes_before_toggling() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device": device("integrated", true), "repeat_state": "off",
+                "shuffle_state": false, "context": null, "timestamp": 0,
+                "progress_ms": 1000, "is_playing": true, "item": null,
+                "currently_playing_type": "track", "actions": {"disallows": {}}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player/pause"))
+            .and(query_param("device_id", "integrated"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let playback = client
+            .handle_player_request(PlayerRequest::ResumePause, None, Some(&state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!playback.is_playing);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_playback_without_integrated_player_reports_an_error() {
+        let server = MockServer::start().await;
+        let err = playback_client(&server)
+            .await
+            .handle_player_request(PlayerRequest::Resume, None, None)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requires a running integrated player"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_playback_does_not_activate_a_device_for_pause() {
+        let server = MockServer::start().await;
+        let err = playback_client(&server)
+            .await
+            .handle_player_request(PlayerRequest::Pause, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "no playback found");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn failed_activation_does_not_attempt_to_resume() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        mock_missing_playback(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player/play"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let err = client
+            .handle_player_request(PlayerRequest::Resume, None, Some(&state))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "reactivate the integrated Spotify device");
+    }
 
     fn sample_track(id: &'static str, name: &str) -> Track {
         Track {

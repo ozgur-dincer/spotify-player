@@ -269,6 +269,12 @@ Stream music directly from the terminal. The streaming feature is enabled by def
 
 The app uses [librespot](https://github.com/librespot-org/librespot) to create an integrated Spotify client, registering a `spotify-player` device accessible via Spotify Connect.
 
+If playback disappears after the client has been idle, play/pause or starting a track automatically reactivates this instance's integrated player. Automatic recovery never falls back to another Spotify device and requires streaming to be enabled in the running instance.
+
+With streaming enabled, startup and session reconnection also activate this instance's integrated player rather than selecting another active device.
+
+If the integrated Spotify Connect task stops, the app automatically reconnects its session instead of leaving an unavailable device registered locally.
+
 #### Audio backend
 
 Default audio backend is [rodio](https://github.com/RustAudio/rodio). Available backends:

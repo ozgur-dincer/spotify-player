@@ -251,12 +251,12 @@ pub async fn new_connection(
     // Created before spawning the player event task below so that the task can hold
     // a handle to `spirc` and revert unsolicited remote volume commands (see the
     // `VolumeChanged` handling below).
-    let (spirc, spirc_task) = Spirc::new(connect_config, session, creds, player, mixer)
+    let (spirc, spirc_task) = Spirc::new(connect_config, session.clone(), creds, player, mixer)
         .await
         .context("initialize spirc")?;
     let spirc = Arc::new(spirc);
 
-    let player_event_task = tokio::task::spawn({
+    let mut player_event_task = tokio::task::spawn({
         let mut channel = player_event_channel;
         let spirc = Arc::clone(&spirc);
         async move {
@@ -376,10 +376,26 @@ pub async fn new_connection(
         }
     });
 
-    tokio::task::spawn(async move {
-        tokio::select! {
-            () = spirc_task => {},
-            _ = player_event_task => {}
+    tokio::task::spawn({
+        let spirc = Arc::clone(&spirc);
+        async move {
+            tokio::select! {
+                () = spirc_task => {
+                    tracing::warn!("Integrated Spotify Connect task stopped; reconnecting the session");
+                    player_event_task.abort();
+                },
+                result = &mut player_event_task => {
+                    match result {
+                        Ok(()) => tracing::warn!("Integrated player event channel closed; reconnecting the session"),
+                        Err(err) => tracing::error!("Integrated player event task failed: {err:#}"),
+                    }
+                    if let Err(err) = spirc.shutdown() {
+                        tracing::warn!("Failed to shut down stopped integrated player: {err:#}");
+                    }
+                }
+            }
+            // A stopped Connect task can leave a session valid but its device unavailable.
+            session.shutdown();
         }
     });
 

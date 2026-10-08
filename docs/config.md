@@ -85,6 +85,9 @@ spotify_player -o device.volume=80 -o theme=dracula
 - `ap_port` and `proxy` are passed to Librespot for session configuration. Librespot uses its defaults if unset.
 - Setting a positive `app_refresh_duration_in_ms` increases API usage and may trigger rate limits. By default, `playback_refresh_duration_in_ms=0` refreshes playback only on events or commands.
 - `enable_streaming` accepts `Always`, `Never`, or `DaemonOnly`. For backward compatibility, `true`/`false` are also accepted.
+- When playback is missing, play/pause and start commands automatically reactivate only this instance's integrated player. Automatic recovery requires streaming in the running instance; it never falls back to another Spotify device.
+- With streaming enabled, startup and session reconnection activate this instance's integrated player even if another Spotify device is active.
+- A stopped integrated Spotify Connect task triggers automatic session reconnection; this does not depend on `playback_refresh_duration_in_ms`.
 - `border_type`, `progress_bar_type`, and `progress_bar_position` accept only the values listed in the table above.
 - `explicit_icon` can be set to any Unicode character or an empty string to disable explicit markers.
 - `cover_img_length = 0` (the default) auto-derives the cover's column count from the terminal's cell aspect ratio. Set a non-zero `cover_img_length` to size the box manually.

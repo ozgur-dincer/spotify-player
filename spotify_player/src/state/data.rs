@@ -1,5 +1,8 @@
 use std::io::{BufReader, BufWriter};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::LazyLock;
@@ -31,6 +34,7 @@ pub struct AppData {
     pub user_data: UserData,
     pub caches: MemoryCaches,
     pub browse: BrowseData,
+    loading_contexts: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -124,7 +128,21 @@ impl AppData {
             user_data: UserData::new_from_file_caches(cache_folder),
             caches: MemoryCaches::new(),
             browse: BrowseData::default(),
+            loading_contexts: HashSet::new(),
         }
+    }
+
+    pub fn begin_context_load(&mut self, uri: &str, always_refresh: bool) -> bool {
+        (always_refresh || !self.caches.context.contains_key(uri))
+            && self.loading_contexts.insert(uri.to_string())
+    }
+
+    pub fn context_load_in_progress(&self, uri: &str) -> bool {
+        self.loading_contexts.contains(uri)
+    }
+
+    pub fn finish_context_load(&mut self, uri: &str) {
+        self.loading_contexts.remove(uri);
     }
 
     /// Get a list of tracks inside a given context
@@ -288,7 +306,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryCaches, SearchCacheEntry, SearchResults};
+    use super::{AppData, MemoryCaches, SearchCacheEntry, SearchResults};
+    use std::path::Path;
+
+    #[test]
+    fn context_load_lifecycle_suppresses_duplicate_requests() {
+        let mut data = AppData::new(Path::new("missing-test-cache-directory"));
+
+        assert!(data.begin_context_load("playlist:example", false));
+        assert!(data.context_load_in_progress("playlist:example"));
+        assert!(!data.begin_context_load("playlist:example", false));
+
+        data.finish_context_load("playlist:example");
+
+        assert!(!data.context_load_in_progress("playlist:example"));
+        assert!(data.begin_context_load("playlist:example", false));
+    }
 
     #[test]
     fn search_lifecycle_suppresses_duplicate_requests() {

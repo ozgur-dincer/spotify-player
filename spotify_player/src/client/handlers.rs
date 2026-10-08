@@ -168,6 +168,7 @@ fn handle_page_change_event(
             if let Some(id) = id {
                 if !matches!(id, ContextId::Tracks(_))
                     && !state.data.read().caches.context.contains_key(&id.uri())
+                    && !state.data.read().context_load_in_progress(&id.uri())
                     && (new_id
                         || handler_state.last_get_context.elapsed() > CONTEXT_REFRESH_THROTTLE)
                 {

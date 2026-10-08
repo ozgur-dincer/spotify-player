@@ -35,7 +35,7 @@ spotify_player -o device.volume=80 -o theme=dracula
 | `ncspot_only_get_endpoints`       | Endpoint prefixes for GET requests that should always use the ncspot client.                        | `["me/playlists", "playlists/"]`                                       |
 | `login_redirect_uri`              | Redirect URI for authentication.                                                                    | `http://127.0.0.1:8989/login`                                          |
 | `client_port`                     | Port for the application's client to handle CLI commands.                                           | `8080`                                                                 |
-| `log_folder`                      | Path to store log files.                                                                            | `None`                                                                 |
+| `log_folder`                      | Directory for `spotify-player.log`, daily timestamped log backups, and per-launch panic backtraces.  | `None`                                                                 |
 | `tracks_playback_limit`           | Maximum number of tracks in a playback session.                                                     | `50`                                                                   |
 | `top_tracks_limit`                | Maximum number of tracks returned on the user's top tracks page.                                    | `100`                                                                  |
 | `playback_format`                 | Format string for the playback window.                                                              | `{status} {track} • {artists} {liked}\n{album} • {genres}\n{metadata}` |
@@ -80,6 +80,7 @@ spotify_player -o device.volume=80 -o theme=dracula
 
 ### Notes
 
+- Logs append to `spotify-player.log` across launches on the same local calendar day. At launch on a later day, the current log is archived with its starting timestamp; backups are not overwritten or deleted. Rotation is checked only at launch. `log_folder = None` uses the cache folder.
 - By default, `spotify-player` uses [ncspot](https://github.com/hrkfdn/ncspot)'s client ID for compatibility with Spotify's API. When a custom `client_id` is configured, most requests use it first and any `4xx` response is retried once with a separately authenticated ncspot fallback client. Each Web API token is stored as `<client_id>_token.json`, so changing `client_id` selects a different cache instead of reusing a token issued to another client. The fallback OAuth flow always uses `http://127.0.0.1:8989/login`, while `login_redirect_uri` applies only to the custom client. See the [Authentication section of the README](../README.md#authentication) for details.
 - The custom client has no request middleware. For ncspot requests, `spotify-player` stores `Retry-After` durations globally and retries GET requests up to `api_rate_limit_retries` times. New ncspot GET requests wait for an active `Retry-After` period, while mutation requests are never delayed or retried by the middleware.
 - `ap_port` and `proxy` are passed to Librespot for session configuration. Librespot uses its defaults if unset.

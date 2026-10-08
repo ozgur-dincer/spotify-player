@@ -24,6 +24,55 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::config::apply_config_override;
 
+fn open_current_log(
+    log_folder: &std::path::Path,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<std::fs::File> {
+    use std::io::BufRead;
+
+    let path = log_folder.join("spotify-player.log");
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            let mut first_line = String::new();
+            std::io::BufReader::new(&file)
+                .read_line(&mut first_line)
+                .context("read current log timestamp")?;
+            // Use the first entry, not mtime: ongoing writes must not postpone rotation.
+            let started = if let Some(timestamp) = first_line.split_whitespace().next() {
+                chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .context("parse current log timestamp")?
+                    .with_timezone(&chrono::Local)
+            } else {
+                let metadata = file.metadata().context("read current log metadata")?;
+                chrono::DateTime::<chrono::Local>::from(
+                    metadata
+                        .created()
+                        .or_else(|_| metadata.modified())
+                        .context("read empty log file age")?,
+                )
+            };
+            drop(file);
+            if started.date_naive() < now.date_naive() {
+                let prefix = format!("spotify-player-{}", started.format("%Y-%m-%d-%H-%M-%S"));
+                let mut backup = log_folder.join(format!("{prefix}.log"));
+                let mut suffix = 1_u32;
+                while backup.try_exists().context("check log backup path")? {
+                    backup = log_folder.join(format!("{prefix}-{suffix}.log"));
+                    suffix += 1;
+                }
+                std::fs::rename(&path, &backup).context("archive previous day's log")?;
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context("open current log for rotation"),
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .context("open current log for appending")
+}
+
 fn init_logging(
     log_folder: &std::path::Path,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
@@ -46,8 +95,7 @@ fn init_logging(
     if !log_folder.exists() {
         std::fs::create_dir_all(log_folder)?;
     }
-    let log_file = std::fs::File::create(log_folder.join(format!("{log_prefix}.log")))
-        .context("failed to create log file")?;
+    let log_file = open_current_log(log_folder, chrono::Local::now())?;
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
@@ -321,5 +369,130 @@ fn main() -> Result<()> {
             start_app(&state)
         }
         Some((cmd, args)) => cli::handle_cli_subcommand(cmd, args),
+    }
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::open_current_log;
+    use chrono::{Local, TimeZone};
+    use std::{io::Write, path::PathBuf};
+
+    struct LogDirectory(PathBuf);
+
+    impl LogDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "spotify-player-log-tests-{}-{}",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn files(&self) -> Vec<PathBuf> {
+            std::fs::read_dir(&self.0)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect()
+        }
+    }
+
+    impl Drop for LogDirectory {
+        fn drop(&mut self) {
+            for path in self.files() {
+                std::fs::remove_file(path).unwrap();
+            }
+            std::fs::remove_dir(&self.0).unwrap();
+        }
+    }
+
+    fn now() -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 10, 8, 0, 0, 1)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn new_log_uses_stable_name_and_same_day_launches_append() {
+        let directory = LogDirectory::new();
+        let entry = format!("{} INFO first launch\n", now().to_rfc3339());
+        {
+            let mut file = open_current_log(&directory.0, now()).unwrap();
+            file.write_all(entry.as_bytes()).unwrap();
+        }
+        {
+            let mut file = open_current_log(&directory.0, now()).unwrap();
+            writeln!(file, "second launch").unwrap();
+        }
+        assert_eq!(directory.files().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("spotify-player.log")).unwrap(),
+            format!("{entry}second launch\n")
+        );
+    }
+
+    #[test]
+    fn new_calendar_day_archives_log_even_if_recently_modified() {
+        let directory = LogDirectory::new();
+        let started = now() - chrono::Duration::seconds(2);
+        let entry = format!("{} INFO previous day\n", started.to_rfc3339());
+        let current = directory.0.join("spotify-player.log");
+        std::fs::write(&current, &entry).unwrap();
+        drop(open_current_log(&directory.0, now()).unwrap());
+        let backup = directory.0.join(format!(
+            "spotify-player-{}.log",
+            started.format("%Y-%m-%d-%H-%M-%S")
+        ));
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), entry);
+        assert_eq!(std::fs::read_to_string(current).unwrap(), "");
+        assert_eq!(directory.files().len(), 2);
+    }
+
+    #[test]
+    fn rotation_does_not_overwrite_existing_backups() {
+        let directory = LogDirectory::new();
+        let started = now() - chrono::Duration::days(1);
+        let prefix = format!("spotify-player-{}", started.format("%Y-%m-%d-%H-%M-%S"));
+        let backup = directory.0.join(format!("{prefix}.log"));
+        let next_backup = directory.0.join(format!("{prefix}-1.log"));
+        std::fs::write(&backup, "existing backup").unwrap();
+        std::fs::write(&next_backup, "another backup").unwrap();
+        let entry = format!("{} INFO old log\n", started.to_rfc3339());
+        std::fs::write(directory.0.join("spotify-player.log"), &entry).unwrap();
+        drop(open_current_log(&directory.0, now()).unwrap());
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "existing backup");
+        assert_eq!(
+            std::fs::read_to_string(next_backup).unwrap(),
+            "another backup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join(format!("{prefix}-2.log"))).unwrap(),
+            entry
+        );
+    }
+
+    #[test]
+    fn empty_log_can_be_reopened() {
+        let directory = LogDirectory::new();
+        drop(open_current_log(&directory.0, Local::now()).unwrap());
+        drop(open_current_log(&directory.0, Local::now()).unwrap());
+        assert_eq!(directory.files().len(), 1);
+    }
+
+    #[test]
+    fn invalid_log_timestamp_reports_error_without_changing_file() {
+        let directory = LogDirectory::new();
+        let current = directory.0.join("spotify-player.log");
+        std::fs::write(&current, "invalid timestamp\n").unwrap();
+        let err = open_current_log(&directory.0, now()).unwrap_err();
+        assert_eq!(err.to_string(), "parse current log timestamp");
+        assert_eq!(
+            std::fs::read_to_string(current).unwrap(),
+            "invalid timestamp\n"
+        );
+        assert_eq!(directory.files().len(), 1);
     }
 }

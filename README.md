@@ -560,7 +560,9 @@ By default, cache files are stored in `$HOME/.cache/spotify-player` (logs, crede
 
 ### Logging
 
-Logs are stored in `$APP_CACHE_FOLDER/spotify-player-*.log`. For debugging or issues, check the backtrace file in `$APP_CACHE_FOLDER/spotify-player-*.backtrace`.
+The current log is `$APP_CACHE_FOLDER/spotify-player.log` (or in `log_folder`, if configured). Launches on the same local calendar day append to this file. On the first launch of a new day, the previous log is moved to `spotify-player-YYYY-MM-DD-HH-MM-SS.log` and a new current log is started. Existing backups are retained; name collisions receive a numeric suffix. Rotation happens at launch, not while the app is running.
+
+For debugging or issues, check the per-launch backtrace file in `$APP_CACHE_FOLDER/spotify-player-*.backtrace` (or `log_folder`).
 
 Set the `RUST_LOG` environment variable to control [logging level](https://docs.rs/log/0.4.14/log/enum.Level.html). Default is `spotify_player=INFO`.
 

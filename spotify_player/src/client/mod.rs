@@ -78,7 +78,7 @@ pub struct AppClient {
     api_client: WebApiClient,
     session_reconnect: Arc<tokio::sync::Mutex<()>>,
     #[cfg(feature = "streaming")]
-    stream_conn: Arc<Mutex<Option<Arc<librespot_connect::Spirc>>>>,
+    stream_conn: Arc<Mutex<Option<Arc<crate::streaming::StreamingConnection>>>>,
 }
 
 impl Deref for AppClient {
@@ -240,7 +240,8 @@ impl AppClient {
                             max_retries,
                             "Trying to connect to device"
                         );
-                        if let Err(err) = client.transfer_playback(&device_id, Some(false)).await {
+                        if let Err(err) = client.transfer_playback_locally(&device_id, false).await
+                        {
                             tracing::warn!(%device_id, "Connection failed: {err:#}");
                         } else {
                             tracing::info!(%device_id, "Connection succeeded!");
@@ -352,22 +353,45 @@ impl AppClient {
         Ok(())
     }
 
-    /// Pause the integrated streaming client, if a connection exists.
-    ///
-    /// Returns `true` if a streaming connection was present and the pause
-    /// command was issued. Used to suppress Spotify's auto-resume of the
-    /// previous session on startup when `pause_on_startup` is enabled.
-    #[cfg(feature = "streaming")]
-    pub fn pause_streaming_on_startup(&self) -> bool {
-        match self.stream_conn.lock().as_ref() {
-            Some(spirc) => {
-                if let Err(err) = spirc.pause() {
-                    tracing::warn!("Failed to pause integrated client on startup: {err:#}");
-                }
-                true
+    #[cfg_attr(not(feature = "streaming"), allow(unused_variables))]
+    async fn pause_local_playback(
+        &self,
+        device_id: Option<&str>,
+        state: Option<&SharedState>,
+    ) -> Result<()> {
+        #[cfg(feature = "streaming")]
+        if state.is_some_and(|state| state.is_streaming_enabled())
+            && device_id == Some(self.spotify.session().await.device_id())
+        {
+            let connection = self.stream_conn.lock().clone();
+            if let Some(connection) = connection {
+                return connection.pause();
             }
-            None => false,
         }
+        self.pause_playback(device_id).await?;
+        Ok(())
+    }
+
+    async fn transfer_playback_locally(&self, device_id: &str, force_play: bool) -> Result<()> {
+        #[cfg(feature = "streaming")]
+        let connection = if !force_play && device_id == self.spotify.session().await.device_id() {
+            self.stream_conn.lock().clone()
+        } else {
+            None
+        };
+        #[cfg(feature = "streaming")]
+        let pause_generation = connection
+            .as_ref()
+            .map(|connection| connection.allow_pause());
+        let result = self.transfer_playback(device_id, Some(force_play)).await;
+        #[cfg(feature = "streaming")]
+        if result.is_err() {
+            if let (Some(connection), Some(generation)) = (connection, pause_generation) {
+                connection.cancel_pause(generation);
+            }
+        }
+        result?;
+        Ok(())
     }
 
     /// Records a volume change intentionally requested by this application (via
@@ -421,7 +445,8 @@ impl AppClient {
             PlayerRequest::TransferPlayback(device_id, force_play) => {
                 // `TransferPlayback` needs to be handled separately from other player requests
                 // because `TransferPlayback` doesn't require an active playback
-                self.transfer_playback(&device_id, Some(force_play)).await?;
+                self.transfer_playback_locally(&device_id, force_play)
+                    .await?;
                 tracing::info!("Transferred playback to device with id={}", device_id);
                 return Ok(None);
             }
@@ -478,13 +503,13 @@ impl AppClient {
 
             PlayerRequest::Pause => {
                 if playback.is_playing {
-                    self.pause_playback(device_id).await?;
+                    self.pause_local_playback(device_id, state).await?;
                     playback.is_playing = false;
                 }
             }
             PlayerRequest::ResumePause => {
                 if playback.is_playing {
-                    self.pause_playback(device_id).await?;
+                    self.pause_local_playback(device_id, state).await?;
                 } else {
                     self.resume_playback(device_id, None).await?;
                 }
@@ -918,7 +943,7 @@ impl AppClient {
     }
 
     async fn activate_integrated_device(&self, device_id: &str) -> Result<()> {
-        self.transfer_playback(device_id, Some(false))
+        self.transfer_playback_locally(device_id, false)
             .await
             .context("reactivate the integrated Spotify device")?;
         tracing::info!(%device_id, "Reactivated integrated device to recover missing playback");

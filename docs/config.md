@@ -88,6 +88,7 @@ spotify_player -o device.volume=80 -o theme=dracula
 - When playback is missing, play/pause and start commands automatically reactivate only this instance's integrated player. Automatic recovery requires streaming in the running instance; it never falls back to another Spotify device.
 - With streaming enabled, startup and session reconnection activate this instance's integrated player even if another Spotify device is active.
 - A stopped integrated Spotify Connect task triggers automatic session reconnection; this does not depend on `playback_refresh_duration_in_ms`.
+- Unexpected pauses of the integrated player are undone after they occur. Local TUI/CLI pause requests, OS media keys, `pause_on_startup`, and shutdown remain allowed. Librespot does not expose the pause sender; a rejected pause may briefly interrupt audio.
 - `border_type`, `progress_bar_type`, and `progress_bar_position` accept only the values listed in the table above.
 - `explicit_icon` can be set to any Unicode character or an empty string to disable explicit markers.
 - `cover_img_length = 0` (the default) auto-derives the cover's column count from the terminal's cell aspect ratio. Set a non-zero `cover_img_length` to size the box manually.

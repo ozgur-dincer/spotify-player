@@ -12,6 +12,7 @@ use librespot_playback::{
     mixer::{self, Mixer},
     player,
 };
+use parking_lot::Mutex;
 use rspotify::model::{EpisodeId, Id, PlayableId, TrackId};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,91 @@ use std::sync::Arc;
 /// reconnecting mid-session (e.g. via `RestartIntegratedClient`) does not
 /// pause an intentionally playing track.
 static IS_FIRST_CONNECTION: AtomicBool = AtomicBool::new(true);
+
+#[derive(Default)]
+struct PauseGuard {
+    playing: bool,
+    local_pause: bool,
+    shutting_down: bool,
+    pause_generation: u64,
+}
+
+impl PauseGuard {
+    fn allow_pause(&mut self) -> u64 {
+        self.pause_generation = self.pause_generation.wrapping_add(1);
+        self.local_pause = self.playing;
+        self.pause_generation
+    }
+
+    fn cancel_pause(&mut self, generation: u64) {
+        if self.pause_generation == generation {
+            self.local_pause = false;
+        }
+    }
+
+    fn paused(&mut self) -> bool {
+        if self.shutting_down || self.local_pause || !self.playing {
+            self.local_pause = false;
+            self.playing = false;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn reset(&mut self) {
+        self.playing = false;
+        self.local_pause = false;
+    }
+
+    fn handle_event(&mut self, event: &player::PlayerEvent) -> bool {
+        if self.shutting_down {
+            return false;
+        }
+        match event {
+            player::PlayerEvent::Playing { .. } => self.playing = true,
+            player::PlayerEvent::Paused { .. } => return self.paused(),
+            player::PlayerEvent::Loading { .. }
+            | player::PlayerEvent::Stopped { .. }
+            | player::PlayerEvent::EndOfTrack { .. }
+            | player::PlayerEvent::Unavailable { .. } => self.reset(),
+            _ => {}
+        }
+        false
+    }
+}
+
+pub struct StreamingConnection {
+    spirc: Arc<Spirc>,
+    pause_guard: Mutex<PauseGuard>,
+}
+
+impl StreamingConnection {
+    pub fn pause(&self) -> anyhow::Result<()> {
+        let mut guard = self.pause_guard.lock();
+        self.spirc.pause().context("pause integrated player")?;
+        guard.allow_pause();
+        Ok(())
+    }
+
+    pub fn allow_pause(&self) -> u64 {
+        self.pause_guard.lock().allow_pause()
+    }
+
+    pub fn cancel_pause(&self, generation: u64) {
+        self.pause_guard.lock().cancel_pause(generation);
+    }
+
+    pub fn shutdown(&self) -> anyhow::Result<()> {
+        let mut guard = self.pause_guard.lock();
+        self.spirc
+            .shutdown()
+            .context("shut down integrated player")?;
+        guard.reset();
+        guard.shutting_down = true;
+        Ok(())
+    }
+}
 
 #[cfg(not(any(
     feature = "rodio-backend",
@@ -163,7 +249,7 @@ pub async fn new_connection(
     state: SharedState,
     session: Session,
     creds: Credentials,
-) -> anyhow::Result<Arc<Spirc>> {
+) -> anyhow::Result<Arc<StreamingConnection>> {
     let configs = config::get_config();
     let device = &configs.app_config.device;
 
@@ -255,13 +341,19 @@ pub async fn new_connection(
         .await
         .context("initialize spirc")?;
     let spirc = Arc::new(spirc);
+    let connection = Arc::new(StreamingConnection {
+        spirc: Arc::clone(&spirc),
+        pause_guard: Mutex::new(PauseGuard::default()),
+    });
 
     let mut player_event_task = tokio::task::spawn({
         let mut channel = player_event_channel;
         let spirc = Arc::clone(&spirc);
+        let connection = Arc::clone(&connection);
         async move {
             let mut pause_armed = pause_on_startup;
             while let Some(event) = channel.recv().await {
+                let unexpected_pause = connection.pause_guard.lock().handle_event(&event);
                 // Suppress Spotify's auto-resume of the previous session on
                 // startup. The `librespot` connect transfer finalizes the
                 // play state asynchronously, so a single reactive pause is not
@@ -273,21 +365,37 @@ pub async fn new_connection(
                         // is a no-op if the transfer has not set the play state
                         // yet, so we do NOT disarm here.
                         player::PlayerEvent::Loading { .. } => {
-                            client.pause_streaming_on_startup();
+                            if let Err(err) = connection.pause() {
+                                tracing::warn!(
+                                    "Failed to pause integrated client on startup: {err:#}"
+                                );
+                            }
                         }
                         // Authoritative: playback actually started (the transfer
                         // finalized into "playing"). Pause and stop interfering.
-                        player::PlayerEvent::Playing { .. } => {
-                            if client.pause_streaming_on_startup() {
-                                pause_armed = false;
-                            }
-                        }
+                        player::PlayerEvent::Playing { .. } => match connection.pause() {
+                            Ok(()) => pause_armed = false,
+                            Err(err) => tracing::warn!(
+                                "Failed to pause integrated client on startup: {err:#}"
+                            ),
+                        },
                         // The track finished loading already paused, i.e. the
                         // `Loading` pause above took effect and no audio played.
                         player::PlayerEvent::Paused { .. } => {
                             pause_armed = false;
                         }
                         _ => {}
+                    }
+                }
+
+                if unexpected_pause {
+                    // Librespot does not expose the command sender and has already paused.
+                    tracing::warn!(
+                        "Detected an unsolicited pause of the integrated player; resuming playback"
+                    );
+                    match spirc.play() {
+                        Ok(()) => continue,
+                        Err(err) => tracing::error!("Failed to undo unsolicited pause: {err:#}"),
                     }
                 }
 
@@ -401,5 +509,121 @@ pub async fn new_connection(
 
     tracing::info!("New streaming connection has been established!");
 
-    Ok(spirc)
+    Ok(connection)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PauseGuard;
+    use librespot_core::SpotifyUri;
+    use librespot_playback::player::PlayerEvent;
+
+    fn playing() -> PlayerEvent {
+        PlayerEvent::Playing {
+            play_request_id: 1,
+            track_id: SpotifyUri::from_uri("spotify:track:3n3Ppam7vgaVa1iaRUc9Lp").unwrap(),
+            position_ms: 1000,
+        }
+    }
+
+    fn paused() -> PlayerEvent {
+        PlayerEvent::Paused {
+            play_request_id: 1,
+            track_id: SpotifyUri::from_uri("spotify:track:3n3Ppam7vgaVa1iaRUc9Lp").unwrap(),
+            position_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn unsolicited_pause_is_reverted_even_when_repeated() {
+        let mut guard = PauseGuard::default();
+        assert!(!guard.handle_event(&playing()));
+        assert!(guard.handle_event(&paused()));
+        assert!(guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn local_pause_is_accepted_and_does_not_allow_a_later_remote_pause() {
+        let mut guard = PauseGuard::default();
+        guard.handle_event(&playing());
+        guard.allow_pause();
+        assert!(!guard.handle_event(&paused()));
+        guard.handle_event(&playing());
+        assert!(guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn pause_without_playback_is_not_resumed() {
+        assert!(!PauseGuard::default().paused());
+    }
+
+    #[test]
+    fn loading_and_shutdown_clear_previous_playback_and_pause_intent() {
+        let mut guard = PauseGuard {
+            playing: true,
+            local_pause: true,
+            ..Default::default()
+        };
+        guard.handle_event(&PlayerEvent::Loading {
+            play_request_id: 2,
+            track_id: SpotifyUri::from_uri("spotify:track:3n3Ppam7vgaVa1iaRUc9Lp").unwrap(),
+            position_ms: 0,
+        });
+        assert!(!guard.handle_event(&paused()));
+        guard.handle_event(&playing());
+        assert!(guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn queued_playing_event_does_not_erase_local_pause_intent() {
+        let mut guard = PauseGuard {
+            playing: true,
+            ..Default::default()
+        };
+        guard.allow_pause();
+        guard.handle_event(&playing());
+        assert!(!guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn no_op_local_pause_does_not_authorize_a_future_remote_pause() {
+        let mut guard = PauseGuard::default();
+        guard.allow_pause();
+        guard.playing = true;
+        assert!(guard.paused());
+    }
+
+    #[test]
+    fn shutdown_pause_is_not_reverted() {
+        let mut guard = PauseGuard {
+            playing: true,
+            shutting_down: true,
+            ..Default::default()
+        };
+        guard.handle_event(&playing());
+        assert!(!guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn failed_transfer_does_not_cancel_a_newer_local_pause() {
+        let mut guard = PauseGuard {
+            playing: true,
+            ..Default::default()
+        };
+        let transfer = guard.allow_pause();
+        guard.allow_pause();
+        guard.cancel_pause(transfer);
+        assert!(!guard.handle_event(&paused()));
+    }
+
+    #[test]
+    fn failed_transfer_does_not_authorize_a_remote_pause() {
+        let mut guard = PauseGuard {
+            playing: true,
+            ..Default::default()
+        };
+        let transfer = guard.allow_pause();
+        guard.cancel_pause(transfer);
+        assert!(guard.handle_event(&paused()));
+    }
 }

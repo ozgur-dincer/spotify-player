@@ -7,11 +7,11 @@ use crate::{auth, config};
 use crate::{
     auth::AuthConfig,
     state::{
-        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, Category, Context, ContextId,
-        Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback, PlaybackMetadata, Playlist,
-        PlaylistFolderItem, PlaylistId, SearchResults, SharedState, Show, ShowId, Track, TrackId,
-        UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI, USER_RECENTLY_PLAYED_TRACKS_URI,
-        USER_TOP_TRACKS_URI,
+        store_data_into_file_cache, Album, AlbumId, Artist, ArtistId, CachedPlaylist, Category,
+        Context, ContextId, Device, FileCacheKey, Item, ItemId, MemoryCaches, Playback,
+        PlaybackMetadata, Playlist, PlaylistFolderItem, PlaylistId, SearchResults, SharedState,
+        Show, ShowId, Track, TrackId, UserId, TTL_CACHE_DURATION, USER_LIKED_TRACKS_URI,
+        USER_RECENTLY_PLAYED_TRACKS_URI, USER_TOP_TRACKS_URI,
     },
 };
 
@@ -420,24 +420,40 @@ impl AppClient {
         >,
     ) -> Result<Option<PlaybackMetadata>> {
         let mut recovery_device = None;
-        if playback.is_none()
-            && matches!(
-                request,
-                PlayerRequest::Resume
-                    | PlayerRequest::ResumePause
-                    | PlayerRequest::StartPlayback(..)
-            )
-        {
-            let device_id = self.integrated_device_id(state).await?;
-            playback = self
-                .current_playback2()
-                .await?
-                .filter(|p| {
-                    p.device.is_active && p.device.id.as_deref() == Some(device_id.as_str())
-                })
-                .as_ref()
-                .map(PlaybackMetadata::from_playback);
-            recovery_device = Some(device_id);
+        if matches!(
+            request,
+            PlayerRequest::Resume | PlayerRequest::ResumePause | PlayerRequest::StartPlayback(..)
+        ) {
+            #[allow(unused_mut)]
+            let mut verify_integrated_playback = playback.is_none();
+            #[cfg(feature = "streaming")]
+            if state.is_some_and(|state| state.is_streaming_enabled()) {
+                let device_id = self.spotify.session().await.device_id().to_string();
+                verify_integrated_playback |= playback
+                    .as_ref()
+                    .is_some_and(|p| p.device_id.as_deref() == Some(device_id.as_str()));
+            }
+            if verify_integrated_playback {
+                let device_id = self.integrated_device_id(state).await?;
+                let mute_state = playback.as_ref().and_then(|p| p.mute_state);
+                playback = self
+                    .current_playback2()
+                    .await
+                    .context("check current playback before a local playback command")?
+                    .filter(|p| {
+                        p.device.is_active && p.device.id.as_deref() == Some(device_id.as_str())
+                    })
+                    .as_ref()
+                    .map(|p| {
+                        let mut playback = PlaybackMetadata::from_playback(p);
+                        playback.mute_state = mute_state;
+                        if let Some(volume) = mute_state {
+                            playback.volume = Some(volume);
+                        }
+                        playback
+                    });
+                recovery_device = Some(device_id);
+            }
         }
 
         // handle requests that don't require an active playback
@@ -693,12 +709,22 @@ impl AppClient {
                 let uri = context.uri();
                 // Liked tracks must always be refreshed to keep user_data.saved_tracks in sync.
                 let is_liked = uri == USER_LIKED_TRACKS_URI;
-                let should_load = state.data.write().begin_context_load(&uri, is_liked);
+                let is_playlist = matches!(context, ContextId::Playlist(_));
+                let should_load = state
+                    .data
+                    .write()
+                    .begin_context_load(&uri, is_liked || is_playlist);
                 if should_load {
                     let result = async {
                         match context {
                             ContextId::Playlist(playlist_id) => {
-                                self.playlist_context(playlist_id).await
+                                return self
+                                    .refresh_playlist_context(
+                                        &state.data,
+                                        &config::get_config().cache_folder,
+                                        playlist_id,
+                                    )
+                                    .await
                             }
                             ContextId::Album(album_id) => self.album_context(album_id).await,
                             ContextId::Artist(artist_id) => self.artist_context(artist_id).await,
@@ -739,15 +765,18 @@ impl AppClient {
                             },
                             ContextId::Show(show_id) => self.show_context(show_id).await,
                         }
+                        .map(Some)
                     }
                     .await;
 
                     match result {
                         Ok(ctx) => {
                             let mut data = state.data.write();
-                            data.caches
-                                .context
-                                .insert(uri.clone(), ctx, *TTL_CACHE_DURATION);
+                            if let Some(ctx) = ctx {
+                                data.caches
+                                    .context
+                                    .insert(uri.clone(), ctx, *TTL_CACHE_DURATION);
+                            }
                             data.finish_context_load(&uri);
                         }
                         Err(err) => {
@@ -1594,6 +1623,63 @@ impl AppClient {
         .context("convert FullTrack into Track")
     }
 
+    /// Publishes disk contents before checking Spotify; returns replacement contents only if needed.
+    async fn refresh_playlist_context(
+        &self,
+        data: &crate::state::RwLock<crate::state::AppData>,
+        cache_folder: &std::path::Path,
+        playlist_id: PlaylistId<'_>,
+    ) -> Result<Option<Context>> {
+        let uri = playlist_id.uri();
+        let mut cached = data.read().caches.context.get(&uri).cloned();
+        if cached.is_none() {
+            match CachedPlaylist::load(cache_folder, &playlist_id) {
+                Ok(Some(playlist)) => {
+                    let ctx = playlist.into_context();
+                    data.write().caches.context.insert(
+                        uri.clone(),
+                        ctx.clone(),
+                        *TTL_CACHE_DURATION,
+                    );
+                    cached = Some(ctx);
+                    tracing::info!(%uri, "Loaded playlist contents from disk");
+                }
+                Ok(None) => {}
+                Err(err) => tracing::error!("Failed to load playlist cache for {uri}: {err:#}"),
+            }
+        }
+
+        if let Some(Context::Playlist { playlist, .. }) = &cached {
+            #[derive(Deserialize)]
+            struct Snapshot {
+                snapshot_id: String,
+            }
+            let snapshot: Snapshot = self
+                .http_get(
+                    &format!("playlists/{}", playlist_id.id()),
+                    &Query::from([("fields", "snapshot_id")]),
+                )
+                .await
+                .context("check playlist snapshot")?;
+            if snapshot.snapshot_id == playlist.snapshot_id {
+                tracing::info!(%uri, "Playlist snapshot unchanged; using cached contents");
+                return Ok(None);
+            }
+        }
+
+        let ctx = self.playlist_context(playlist_id).await?;
+        if let Context::Playlist { playlist, tracks } = &ctx {
+            let cached = CachedPlaylist {
+                playlist: playlist.clone(),
+                tracks: tracks.clone(),
+            };
+            if let Err(err) = cached.store(cache_folder) {
+                tracing::error!("Failed to store playlist cache for {uri}: {err:#}");
+            }
+        }
+        Ok(Some(ctx))
+    }
+
     /// Get a playlist context data
     pub async fn playlist_context(&self, playlist_id: PlaylistId<'_>) -> Result<Context> {
         let playlist_uri = playlist_id.uri();
@@ -2199,9 +2285,9 @@ mod tests {
     };
     use std::sync::Arc;
     #[cfg(feature = "streaming")]
-    use wiremock::matchers::{body_json, query_param};
+    use wiremock::matchers::body_json;
+    use wiremock::matchers::query_param;
     use wiremock::MockServer;
-    #[cfg(feature = "streaming")]
     use wiremock::{
         matchers::{method, path},
         Mock, ResponseTemplate,
@@ -2231,6 +2317,168 @@ mod tests {
             #[cfg(feature = "streaming")]
             stream_conn: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    fn cached_playlist() -> crate::state::CachedPlaylist {
+        crate::state::CachedPlaylist {
+            playlist: crate::state::Playlist {
+                id: crate::state::PlaylistId::from_id("playlist123").unwrap(),
+                collaborative: false,
+                name: "Cached playlist".to_string(),
+                owner: (
+                    "Owner".to_string(),
+                    crate::state::UserId::from_id("owner").unwrap(),
+                ),
+                desc: String::new(),
+                current_folder_id: 0,
+                snapshot_id: "old-snapshot".to_string(),
+            },
+            tracks: vec![sample_track("track123", "Cached track")],
+        }
+    }
+
+    #[tokio::test]
+    async fn playlist_cache_is_visible_before_unchanged_snapshot_check_completes() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let folder = std::env::temp_dir().join(format!("playlist-cache-{}", rand::random::<u64>()));
+        std::fs::create_dir(&folder).unwrap();
+        let cached = cached_playlist();
+        cached.store(&folder).unwrap();
+        let id = cached.playlist.id.clone();
+        let data = crate::state::RwLock::new(crate::state::AppData::new(&folder));
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .and(query_param("fields", "snapshot_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"snapshot_id": "old-snapshot"}))
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let refresh = client.refresh_playlist_context(&data, &folder, id.clone());
+        tokio::pin!(refresh);
+        tokio::select! {
+            result = &mut refresh => panic!("refresh completed before delayed snapshot check: {result:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                assert_eq!(data.read().context_tracks(&crate::state::ContextId::Playlist(id.clone())).unwrap()[0].name, "Cached track");
+            }
+        }
+        let ctx = refresh.await.unwrap();
+        assert!(ctx.is_none());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        std::fs::remove_file(folder.join("playlist_playlist123_cache.json")).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_playlist_snapshot_refreshes_persistent_cache() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let folder = std::env::temp_dir().join(format!("playlist-cache-{}", rand::random::<u64>()));
+        std::fs::create_dir(&folder).unwrap();
+        let cached = cached_playlist();
+        cached.store(&folder).unwrap();
+        let id = cached.playlist.id.clone();
+        let data = crate::state::RwLock::new(crate::state::AppData::new(&folder));
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .and(query_param("fields", "snapshot_id"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"snapshot_id": "new-snapshot"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .and(query_param("market", "from_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "playlist123", "name": "Updated playlist", "type": "playlist",
+                "uri": "spotify:playlist:playlist123", "href": "https://example.com/playlist",
+                "collaborative": false, "public": false, "description": "",
+                "snapshot_id": "new-snapshot", "external_urls": {}, "images": [],
+                "followers": {"href": null, "total": 1},
+                "owner": {"id": "owner", "display_name": "Owner", "type": "user",
+                    "uri": "spotify:user:owner", "href": "", "external_urls": {}},
+                "items": {"href": "", "items": [], "limit": 50, "next": null,
+                    "offset": 0, "previous": null, "total": 0}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "href": "", "items": [], "limit": 50, "next": null,
+                "offset": 0, "previous": null, "total": 0
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = client
+            .refresh_playlist_context(&data, &folder, id.clone())
+            .await;
+        assert!(
+            result.is_ok(),
+            "{result:?}; requests: {:?}",
+            server.received_requests().await.unwrap()
+        );
+        let ctx = result.unwrap().unwrap();
+        assert!(matches!(ctx, crate::state::Context::Playlist { tracks, .. } if tracks.is_empty()));
+        let stored = crate::state::CachedPlaylist::load(&folder, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.playlist.snapshot_id, "new-snapshot");
+        assert!(stored.tracks.is_empty());
+        std::fs::remove_file(folder.join("playlist_playlist123_cache.json")).unwrap();
+        std::fs::remove_dir(folder).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_playlist_snapshot_check_keeps_cached_contents() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let folder = std::env::temp_dir().join(format!("playlist-cache-{}", rand::random::<u64>()));
+        std::fs::create_dir(&folder).unwrap();
+        let cached = cached_playlist();
+        cached.store(&folder).unwrap();
+        let id = cached.playlist.id.clone();
+        let data = crate::state::RwLock::new(crate::state::AppData::new(&folder));
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .and(query_param("fields", "snapshot_id"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert!(client
+            .refresh_playlist_context(&data, &folder, id.clone())
+            .await
+            .is_err());
+        assert_eq!(
+            data.read()
+                .context_tracks(&crate::state::ContextId::Playlist(id.clone()))
+                .unwrap()[0]
+                .name,
+            "Cached track"
+        );
+        assert_eq!(
+            crate::state::CachedPlaylist::load(&folder, &id)
+                .unwrap()
+                .unwrap()
+                .playlist
+                .snapshot_id,
+            "old-snapshot"
+        );
+        std::fs::remove_file(folder.join("playlist_playlist123_cache.json")).unwrap();
+        std::fs::remove_dir(folder).unwrap();
     }
 
     #[cfg(feature = "streaming")]
@@ -2396,6 +2644,107 @@ mod tests {
 
     #[tokio::test]
     #[cfg(feature = "streaming")]
+    async fn stale_integrated_playback_recovers_only_on_explicit_playback_commands() {
+        for (active_device, active, cached_playing) in [
+            ("phone", true, true),
+            ("phone", true, false),
+            ("integrated", false, true),
+        ] {
+            for request in [
+                PlayerRequest::Resume,
+                PlayerRequest::ResumePause,
+                PlayerRequest::StartPlayback(
+                    Playback::URIs(vec![TrackId::from_id("track123").unwrap().into()], None),
+                    None,
+                ),
+            ] {
+                let server = MockServer::start().await;
+                let client = playback_client(&server).await;
+                let state = integrated_state(&client).await;
+                Mock::given(method("GET"))
+                    .and(path("/v1/me/player"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "device": device(active_device, active), "repeat_state": "off",
+                        "shuffle_state": false, "context": null, "timestamp": 0,
+                        "progress_ms": 1000, "is_playing": true, "item": null,
+                        "currently_playing_type": "track", "actions": {"disallows": {}}
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/v1/me/player"))
+                    .and(body_json(serde_json::json!({
+                        "device_ids": ["integrated"], "play": false
+                    })))
+                    .respond_with(ResponseTemplate::new(204))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/v1/me/player/play"))
+                    .and(query_param("device_id", "integrated"))
+                    .respond_with(ResponseTemplate::new(204))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let cached = crate::state::PlaybackMetadata {
+                    device_name: "integrated".to_string(),
+                    device_id: Some("integrated".to_string()),
+                    volume: Some(50),
+                    is_playing: cached_playing,
+                    repeat_state: rspotify::model::RepeatState::Off,
+                    shuffle_state: false,
+                    mute_state: None,
+                };
+                assert!(client
+                    .handle_player_request(request, Some(cached), Some(&state))
+                    .await
+                    .unwrap()
+                    .is_none());
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[0].method, "GET");
+                assert_eq!(requests[1].url.path(), "/v1/me/player");
+                assert_eq!(requests[2].url.path(), "/v1/me/player/play");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn cached_external_playback_remains_controllable_without_recovery() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player/play"))
+            .and(query_param("device_id", "phone"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cached = crate::state::PlaybackMetadata {
+            device_name: "phone".to_string(),
+            device_id: Some("phone".to_string()),
+            volume: Some(50),
+            is_playing: false,
+            repeat_state: rspotify::model::RepeatState::Off,
+            shuffle_state: false,
+            mute_state: None,
+        };
+        let playback = client
+            .handle_player_request(PlayerRequest::Resume, Some(cached), Some(&state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(playback.is_playing);
+        assert_eq!(playback.device_id.as_deref(), Some("phone"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
     async fn missing_cached_playback_refreshes_before_toggling() {
         let server = MockServer::start().await;
         let client = playback_client(&server).await;
@@ -2424,6 +2773,50 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!playback.is_playing);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn stale_playing_flag_is_refreshed_without_losing_mute_state() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device": device("integrated", true), "repeat_state": "off",
+                "shuffle_state": false, "context": null, "timestamp": 0,
+                "progress_ms": 1000, "is_playing": false, "item": null,
+                "currently_playing_type": "track", "actions": {"disallows": {}}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/me/player/play"))
+            .and(query_param("device_id", "integrated"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cached = crate::state::PlaybackMetadata {
+            device_name: "integrated".to_string(),
+            device_id: Some("integrated".to_string()),
+            volume: Some(0),
+            is_playing: true,
+            repeat_state: rspotify::model::RepeatState::Off,
+            shuffle_state: false,
+            mute_state: Some(75),
+        };
+        let playback = client
+            .handle_player_request(PlayerRequest::ResumePause, Some(cached), Some(&state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(playback.is_playing);
+        assert_eq!(playback.mute_state, Some(75));
+        assert_eq!(playback.volume, Some(75));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 

@@ -271,6 +271,8 @@ The app uses [librespot](https://github.com/librespot-org/librespot) to create a
 
 If playback disappears after the client has been idle, play/pause or starting a track automatically reactivates this instance's integrated player. Automatic recovery never falls back to another Spotify device and requires streaming to be enabled in the running instance.
 
+When cached playback points to the integrated player, explicit play, play/pause, and start-track commands first check Spotify's current state. If playback moved to another device or the integrated player became inactive, these commands transfer playback back to this instance. Background playback checks do not reclaim playback; explicitly selected external devices remain controllable.
+
 With streaming enabled, startup and session reconnection also activate this instance's integrated player rather than selecting another active device.
 
 If the integrated Spotify Connect task stops, the app automatically reconnects its session instead of leaving an unavailable device registered locally.
@@ -557,6 +559,8 @@ See [configuration documentation](https://github.com/aome510/spotify-player/blob
 ## Caches
 
 By default, cache files are stored in `$HOME/.cache/spotify-player` (logs, credentials, audio cache, etc.). Change this with `-C <FOLDER_PATH>` or `--cache-folder <FOLDER_PATH>`.
+
+Playlist contents are saved as `playlist_<ID>_cache.json`. When you open a previously loaded playlist, cached contents appear immediately while its Spotify snapshot ID is checked in the background. Tracks are downloaded again only when the snapshot changes. If the check or refresh fails, cached contents remain visible and the error is logged. The first load still requires Spotify access.
 
 ### Logging
 

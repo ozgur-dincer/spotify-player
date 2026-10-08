@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::sync::LazyLock;
 
 use super::model::{
@@ -23,6 +23,44 @@ pub enum FileCacheKey {
     SavedShows,
     SavedAlbums,
     SavedTracks,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct CachedPlaylist {
+    pub playlist: Playlist,
+    pub tracks: Vec<Track>,
+}
+
+impl CachedPlaylist {
+    pub fn load(cache_folder: &Path, id: &super::PlaylistId<'_>) -> anyhow::Result<Option<Self>> {
+        let path = cache_folder.join(format!("playlist_{}_cache.json", id.id()));
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let cached: Self = serde_json::from_reader(BufReader::new(file))?;
+        anyhow::ensure!(cached.playlist.id == *id, "playlist cache ID mismatch");
+        Ok(Some(cached))
+    }
+
+    pub fn store(&self, cache_folder: &Path) -> anyhow::Result<()> {
+        let path = cache_folder.join(format!("playlist_{}_cache.json", self.playlist.id.id()));
+        let temporary_path = path.with_extension("json.tmp");
+        let mut file = BufWriter::new(std::fs::File::create(&temporary_path)?);
+        serde_json::to_writer(&mut file, self)?;
+        std::io::Write::flush(&mut file)?;
+        drop(file);
+        std::fs::rename(temporary_path, path)?;
+        Ok(())
+    }
+
+    pub fn into_context(self) -> Context {
+        Context::Playlist {
+            playlist: self.playlist,
+            tracks: self.tracks,
+        }
+    }
 }
 
 /// default time-to-live cache duration

@@ -18,6 +18,7 @@ struct PlayerEventHandlerState {
     last_get_context: Instant,
     last_playback_refresh: Instant,
     last_queue_refresh: Option<(String, Instant)>,
+    last_context_uri: Option<String>,
 }
 
 /// starts the client's request handler
@@ -125,7 +126,11 @@ fn handle_page_change_event(
     client_pub: &flume::Sender<ClientRequest>,
     handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
-    match state.ui.lock().current_page_mut() {
+    let mut ui = state.ui.lock();
+    if !matches!(ui.current_page(), PageState::Context { .. }) {
+        handler_state.last_context_uri = None;
+    }
+    match ui.current_page_mut() {
         PageState::Context {
             id,
             context_page_type,
@@ -162,14 +167,17 @@ fn handle_page_change_event(
                 true
             };
 
-            // request new context's data if not found in memory
-            // To avoid making too many requests, only request if context id is changed
-            // or it's been a while since the last request.
+            // Validate playlists on entry; retry missing contexts without overlapping loads.
             if let Some(id) = id {
+                let uri = id.uri();
+                let entered_context = handler_state.last_context_uri.as_ref() != Some(&uri);
+                handler_state.last_context_uri = Some(uri.clone());
                 if !matches!(id, ContextId::Tracks(_))
-                    && !state.data.read().caches.context.contains_key(&id.uri())
-                    && !state.data.read().context_load_in_progress(&id.uri())
+                    && (((new_id || entered_context) && matches!(id, ContextId::Playlist(_)))
+                        || !state.data.read().caches.context.contains_key(&uri))
+                    && !state.data.read().context_load_in_progress(&uri)
                     && (new_id
+                        || entered_context
                         || handler_state.last_get_context.elapsed() > CONTEXT_REFRESH_THROTTLE)
                 {
                     client_pub.send(ClientRequest::GetContext(id.clone()))?;
@@ -230,6 +238,7 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
         last_playback_refresh: Instant::now(),
         ended_playable_uri: None,
         last_queue_refresh: None,
+        last_context_uri: None,
     };
 
     loop {

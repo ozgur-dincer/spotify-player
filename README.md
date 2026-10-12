@@ -572,6 +572,8 @@ For debugging or issues, check the per-launch backtrace file in `$APP_CACHE_FOLD
 
 Set the `RUST_LOG` environment variable to control [logging level](https://docs.rs/log/0.4.14/log/enum.Level.html). Default is `spotify_player=INFO`.
 
+Context pages display load errors instead of remaining at "Loading..." after a failed or interrupted request. Reopen the page to retry; `g o` opens the logs. Web API GET logs include endpoint, query parameters, routing, completion, and failure; restricted playlist metadata is validated before parsing and retried with the ncspot fallback when available. Once a playlist is found to be restricted, its later reads in the same run go straight to ncspot.
+
 ## Acknowledgement
 
 `spotify_player` is written in [Rust](https://www.rust-lang.org) and built on top of libraries like [ratatui](https://github.com/ratatui/ratatui), [rspotify](https://github.com/ramsayleung/rspotify), [librespot](https://github.com/librespot-org/librespot), and more. It is inspired by [spotify-tui](https://github.com/Rigellute/spotify-tui) and [ncspot](https://github.com/hrkfdn/ncspot).

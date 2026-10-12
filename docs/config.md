@@ -382,3 +382,4 @@ action="ToggleLiked"
 key_sequence="C-l"
 ```
 - Failed or cancelled session connections are retried automatically after transient network failures. Reconnection clears stale playback state; integrated-device selection checks session health before activation.
+- With `ncspot_only_get_endpoints = []`, accessible playlists use the custom client; metadata missing `items`/`tracks` is retried through ncspot before parsing. Context load failures are shown in the page and logs; reopen the page to retry.

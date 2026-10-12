@@ -73,6 +73,7 @@ pub struct AppData {
     pub caches: MemoryCaches,
     pub browse: BrowseData,
     loading_contexts: HashSet<String>,
+    pub context_errors: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -167,12 +168,17 @@ impl AppData {
             caches: MemoryCaches::new(),
             browse: BrowseData::default(),
             loading_contexts: HashSet::new(),
+            context_errors: HashMap::new(),
         }
     }
 
     pub fn begin_context_load(&mut self, uri: &str, always_refresh: bool) -> bool {
-        (always_refresh || !self.caches.context.contains_key(uri))
-            && self.loading_contexts.insert(uri.to_string())
+        let started = (always_refresh || !self.caches.context.contains_key(uri))
+            && self.loading_contexts.insert(uri.to_string());
+        if started {
+            self.context_errors.remove(uri);
+        }
+        started
     }
 
     pub fn context_load_in_progress(&self, uri: &str) -> bool {
@@ -181,6 +187,12 @@ impl AppData {
 
     pub fn finish_context_load(&mut self, uri: &str) {
         self.loading_contexts.remove(uri);
+        self.context_errors.remove(uri);
+    }
+
+    pub fn fail_context_load(&mut self, uri: &str, message: String) {
+        self.loading_contexts.remove(uri);
+        self.context_errors.insert(uri.to_string(), message);
     }
 
     /// Get a list of tracks inside a given context
@@ -346,6 +358,20 @@ where
 mod tests {
     use super::{AppData, MemoryCaches, SearchCacheEntry, SearchResults};
     use std::path::Path;
+
+    #[test]
+    fn failed_context_load_is_visible_and_can_be_retried() {
+        let mut data = AppData::new(Path::new("missing-test-cache-directory"));
+        let uri = "playlist:example";
+        assert!(data.begin_context_load(uri, false));
+        data.fail_context_load(uri, "Forbidden".to_string());
+        assert!(!data.context_load_in_progress(uri));
+        assert_eq!(data.context_errors.get(uri).unwrap(), "Forbidden");
+        assert!(data.begin_context_load(uri, false));
+        assert!(!data.context_errors.contains_key(uri));
+        data.finish_context_load(uri);
+        assert!(!data.context_load_in_progress(uri));
+    }
 
     #[test]
     fn context_load_lifecycle_suppresses_duplicate_requests() {

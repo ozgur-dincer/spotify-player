@@ -7,7 +7,7 @@ use rspotify::{
     AuthCodePkceSpotify, ClientError, ClientResult, Config, Credentials, OAuth, Token,
 };
 use serde_json::Value;
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use crate::token;
 
@@ -207,6 +207,8 @@ pub struct WebApiClient {
     primary: PkceWebApiClient,
     fallback: Option<PkceWebApiClient>,
     ncspot_only_get_endpoints: Vec<String>,
+    /// Playlists whose contents the primary client cannot read; their GETs go straight to ncspot.
+    restricted_playlists: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl Default for WebApiClient {
@@ -224,6 +226,7 @@ impl WebApiClient {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            restricted_playlists: Arc::default(),
         }
     }
 
@@ -253,6 +256,35 @@ impl WebApiClient {
             .any(|endpoint| url.starts_with(endpoint))
     }
 
+    fn is_restricted_playlist_get(&self, url: &str) -> bool {
+        let Some(id) = playlist_id_from_url(url) else {
+            return false;
+        };
+        self.fallback.is_some()
+            && self
+                .restricted_playlists
+                .lock()
+                .is_ok_and(|playlists| playlists.contains(id))
+    }
+
+    fn mark_restricted_playlist(&self, url: &str) {
+        let Some(id) = playlist_id_from_url(url) else {
+            return;
+        };
+        if let Ok(mut playlists) = self.restricted_playlists.lock() {
+            if playlists.insert(id.to_string()) {
+                tracing::info!(
+                    playlist_id = id,
+                    "Routing restricted playlist reads to ncspot"
+                );
+            }
+        }
+    }
+
+    fn routes_to_ncspot(&self, url: &str) -> bool {
+        self.is_ncspot_only_get(url) || self.is_restricted_playlist_get(url)
+    }
+
     fn fallback_status(error: &ClientError) -> Option<reqwest::StatusCode> {
         match error {
             ClientError::Http(error) => match error.as_ref() {
@@ -273,6 +305,62 @@ impl WebApiClient {
             "Custom Spotify Web API request failed; retrying with ncspot client"
         );
     }
+
+    async fn get_with_fallback(&self, url: &str, payload: &Query<'_>) -> ClientResult<String> {
+        if self.routes_to_ncspot(url) {
+            return self.ncspot().api_get(url, payload).await;
+        }
+        match self.primary.api_get(url, payload).await {
+            Err(error) => match (Self::fallback_status(&error), &self.fallback) {
+                (Some(status), Some(fallback)) => {
+                    Self::log_fallback("GET", url, status);
+                    let result = fallback.api_get(url, payload).await;
+                    if status == reqwest::StatusCode::FORBIDDEN && result.is_ok() {
+                        self.mark_restricted_playlist(url);
+                    }
+                    result
+                }
+                _ => Err(error),
+            },
+            result => result,
+        }
+    }
+
+    pub(crate) async fn playlist_metadata(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<rspotify::model::FullPlaylist> {
+        let url = format!("playlists/{id}");
+        let params = Query::from([("market", "from_token")]);
+        let text = self.api_get(&url, &params).await?;
+        let mut response: Value = serde_json::from_str(&text)?;
+        if !has_playlist_items(&response) {
+            if !self.routes_to_ncspot(&url) {
+                if let Some(fallback) = &self.fallback {
+                    tracing::warn!(%url, "Custom client returned restricted playlist metadata without items/tracks; retrying with ncspot");
+                    self.mark_restricted_playlist(&url);
+                    let text = fallback.api_get(&url, &params).await?;
+                    response = serde_json::from_str(&text)?;
+                }
+            }
+            anyhow::ensure!(
+                has_playlist_items(&response),
+                "Spotify withheld playlist contents (missing items/tracks); the client may not have access to this subscribed playlist"
+            );
+        }
+        Ok(serde_json::from_value(response)?)
+    }
+}
+
+fn has_playlist_items(response: &Value) -> bool {
+    response.get("items").is_some_and(Value::is_object)
+        || response.get("tracks").is_some_and(Value::is_object)
+}
+
+/// Extracts the playlist ID from `playlists/{id}` and `playlists/{id}/...` URLs.
+fn playlist_id_from_url(url: &str) -> Option<&str> {
+    let id = url.strip_prefix("playlists/")?.split('/').next()?;
+    (!id.is_empty()).then_some(id)
 }
 
 #[maybe_async]
@@ -298,20 +386,18 @@ impl BaseClient for WebApiClient {
     }
 
     async fn api_get(&self, url: &str, payload: &Query<'_>) -> ClientResult<String> {
-        if self.is_ncspot_only_get(url) {
-            return self.ncspot().api_get(url, payload).await;
+        let started = std::time::Instant::now();
+        tracing::info!(%url, ?payload, ncspot_only = self.routes_to_ncspot(url), "Starting Spotify Web API GET");
+        let result = self.get_with_fallback(url, payload).await;
+        match &result {
+            Ok(_) => {
+                tracing::info!(%url, elapsed_ms = started.elapsed().as_millis(), "Completed Spotify Web API GET");
+            }
+            Err(err) => {
+                tracing::error!(%url, elapsed_ms = started.elapsed().as_millis(), "Spotify Web API GET failed: {err:#}");
+            }
         }
-
-        match self.primary.api_get(url, payload).await {
-            Err(error) => match (Self::fallback_status(&error), &self.fallback) {
-                (Some(status), Some(fallback)) => {
-                    Self::log_fallback("GET", url, status);
-                    fallback.api_get(url, payload).await
-                }
-                _ => Err(error),
-            },
-            result => result,
-        }
+        result
     }
 
     async fn api_post(&self, url: &str, payload: &Value) -> ClientResult<String> {
@@ -377,6 +463,170 @@ mod tests {
         matchers::{header, method, path},
         Mock, MockServer, Request, Respond, ResponseTemplate,
     };
+
+    fn playlist_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "playlist123", "name": "Playlist", "type": "playlist",
+            "uri": "spotify:playlist:playlist123", "href": "https://example.com/playlist",
+            "collaborative": false, "public": true, "description": "",
+            "snapshot_id": "snapshot", "external_urls": {}, "images": [],
+            "followers": {"href": null, "total": 1},
+            "owner": {"id": "owner", "display_name": "Owner", "type": "user",
+                "uri": "spotify:user:owner", "href": "", "external_urls": {}},
+            "items": {"href": "", "items": [], "limit": 50, "next": null,
+                "offset": 0, "previous": null, "total": 0}
+        })
+    }
+
+    #[tokio::test]
+    async fn restricted_playlist_metadata_uses_fallback_before_deserialization() {
+        let primary_server = MockServer::start().await;
+        let fallback_server = MockServer::start().await;
+        let mut restricted = playlist_response();
+        restricted.as_object_mut().unwrap().remove("items");
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restricted))
+            .expect(1)
+            .mount(&primary_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(playlist_response()))
+            .expect(1)
+            .mount(&fallback_server)
+            .await;
+        let api = WebApiClient::new(
+            client(&primary_server, false).await,
+            Some(client(&fallback_server, false).await),
+        )
+        .with_ncspot_only_get_endpoints(vec![]);
+        assert_eq!(
+            api.playlist_metadata("playlist123").await.unwrap().name,
+            "Playlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_playlist_without_fallback_returns_error_instead_of_panicking() {
+        let server = MockServer::start().await;
+        let mut restricted = playlist_response();
+        restricted.as_object_mut().unwrap().remove("items");
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restricted))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = WebApiClient::new(client(&server, false).await, None)
+            .with_ncspot_only_get_endpoints(vec![]);
+        let err = api.playlist_metadata("playlist123").await.unwrap_err();
+        assert!(err.to_string().contains("withheld playlist contents"));
+    }
+
+    #[tokio::test]
+    async fn accessible_playlist_does_not_use_fallback() {
+        let primary_server = MockServer::start().await;
+        let fallback_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(playlist_response()))
+            .expect(1)
+            .mount(&primary_server)
+            .await;
+        let api = WebApiClient::new(
+            client(&primary_server, false).await,
+            Some(client(&fallback_server, false).await),
+        )
+        .with_ncspot_only_get_endpoints(vec![]);
+        assert!(api.playlist_metadata("playlist123").await.is_ok());
+        assert!(fallback_server
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn restricted_fallback_metadata_also_returns_error() {
+        let server = MockServer::start().await;
+        let mut restricted = playlist_response();
+        restricted["items"] = serde_json::Value::Null;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restricted))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = WebApiClient::new(client(&server, false).await, None);
+        assert!(api.playlist_metadata("playlist123").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restricted_playlist_routes_later_reads_to_ncspot() {
+        let primary_server = MockServer::start().await;
+        let fallback_server = MockServer::start().await;
+        let mut restricted = playlist_response();
+        restricted.as_object_mut().unwrap().remove("items");
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(restricted))
+            .expect(1)
+            .mount(&primary_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(playlist_response()))
+            .expect(2)
+            .mount(&fallback_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("items"))
+            .expect(1)
+            .mount(&fallback_server)
+            .await;
+        let api = WebApiClient::new(
+            client(&primary_server, false).await,
+            Some(client(&fallback_server, false).await),
+        )
+        .with_ncspot_only_get_endpoints(vec![]);
+
+        api.playlist_metadata("playlist123").await.unwrap();
+        api.playlist_metadata("playlist123").await.unwrap();
+        api.api_get("playlists/playlist123/items", &Query::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forbidden_playlist_items_route_later_pages_to_ncspot() {
+        let primary_server = MockServer::start().await;
+        let fallback_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123/items"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&primary_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/playlist123/items"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("items"))
+            .expect(2)
+            .mount(&fallback_server)
+            .await;
+        let api = WebApiClient::new(
+            client(&primary_server, false).await,
+            Some(client(&fallback_server, false).await),
+        )
+        .with_ncspot_only_get_endpoints(vec![]);
+
+        for _ in 0..2 {
+            api.api_get("playlists/playlist123/items", &Query::new())
+                .await
+                .unwrap();
+        }
+    }
 
     #[derive(Clone)]
     struct RateLimitThenOk {

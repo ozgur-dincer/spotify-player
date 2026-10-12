@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use futures::FutureExt;
 use rspotify::model::Id;
 use tracing::Instrument;
 
@@ -34,8 +35,20 @@ pub async fn start_client_handler(
 
         tokio::task::spawn(
             async move {
-                if let Err(err) = client.handle_request(&state, request).await {
-                    tracing::error!("Failed to handle client request: {err:#}");
+                match std::panic::AssertUnwindSafe(client.handle_request(&state, request))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => tracing::error!("Failed to handle client request: {err:#}"),
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("non-string panic payload");
+                        tracing::error!("Client request panicked: {message}");
+                    }
                 }
             }
             .instrument(span),
@@ -177,6 +190,9 @@ fn handle_page_change_event(
                     && (((new_id || entered_context) && matches!(id, ContextId::Playlist(_)))
                         || !state.data.read().caches.context.contains_key(&uri))
                     && !state.data.read().context_load_in_progress(&uri)
+                    && (new_id
+                        || entered_context
+                        || !state.data.read().context_errors.contains_key(&uri))
                     && (new_id
                         || entered_context
                         || handler_state.last_get_context.elapsed() > CONTEXT_REFRESH_THROTTLE)

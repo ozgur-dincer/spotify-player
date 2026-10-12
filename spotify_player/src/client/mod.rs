@@ -51,6 +51,24 @@ impl Drop for SessionConnectionAttempt {
     }
 }
 
+struct ContextLoadGuard {
+    state: SharedState,
+    uri: String,
+    finished: bool,
+}
+
+impl Drop for ContextLoadGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            tracing::error!(uri = %self.uri, "Context load interrupted before completion");
+            self.state.data.write().fail_context_load(
+                &self.uri,
+                "Load interrupted; reopen this page to retry. See logs for details.".to_string(),
+            );
+        }
+    }
+}
+
 fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
     let Some(item) = response.get_mut("item") else {
         return;
@@ -773,6 +791,11 @@ impl AppClient {
                     .write()
                     .begin_context_load(&uri, is_liked || is_playlist);
                 if should_load {
+                    let mut load = ContextLoadGuard {
+                        state: state.clone(),
+                        uri: uri.clone(),
+                        finished: false,
+                    };
                     let result = async {
                         match context {
                             ContextId::Playlist(playlist_id) => {
@@ -836,9 +859,14 @@ impl AppClient {
                                     .insert(uri.clone(), ctx, *TTL_CACHE_DURATION);
                             }
                             data.finish_context_load(&uri);
+                            load.finished = true;
                         }
                         Err(err) => {
-                            state.data.write().finish_context_load(&uri);
+                            state
+                                .data
+                                .write()
+                                .fail_context_load(&uri, format!("{err:#}"));
+                            load.finished = true;
                             return Err(err);
                         }
                     }
@@ -1744,19 +1772,19 @@ impl AppClient {
         tracing::info!("Get playlist context: {}", playlist_uri);
 
         let playlist = self
-            .playlist(
-                playlist_id.clone(),
-                None,
-                Some(rspotify::model::Market::FromToken),
-            )
-            .await?;
+            .api_client
+            .playlist_metadata(playlist_id.id())
+            .await
+            .context("load playlist metadata")?;
+        tracing::info!(%playlist_uri, total_items = playlist.items.total, "Loaded playlist metadata; fetching contents");
 
         let tracks = self
             .all_paging_items(
                 &format!("playlists/{}/items", playlist_id.id()),
                 playlist.items.total as usize,
             )
-            .await?
+            .await
+            .context("load playlist contents")?
             .into_iter()
             .filter_map(Track::try_from_playlist_item)
             .collect::<Vec<_>>();
@@ -2329,6 +2357,68 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn restricted_playlist_load_records_visible_error_and_releases_loading_marker() {
+        use rspotify::model::Id;
+
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/restricted"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "restricted", "name": "Subscribed playlist"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let id = crate::state::PlaylistId::from_id("restricted").unwrap();
+        let uri = id.uri();
+        let error = client
+            .handle_request(
+                &state,
+                super::ClientRequest::GetContext(crate::state::ContextId::Playlist(id)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("withheld playlist contents"));
+        let data = state.data.read();
+        assert!(!data.context_load_in_progress(&uri));
+        assert!(data
+            .context_errors
+            .get(&uri)
+            .unwrap()
+            .contains("withheld playlist contents"));
+        assert!(!data.caches.context.contains_key(&uri));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "streaming")]
+    async fn interrupted_context_load_clears_loading_marker_and_records_error() {
+        let server = MockServer::start().await;
+        let client = playback_client(&server).await;
+        let state = integrated_state(&client).await;
+        let uri = "spotify:playlist:interrupted";
+        assert!(state.data.write().begin_context_load(uri, false));
+        {
+            let _load = super::ContextLoadGuard {
+                state: state.clone(),
+                uri: uri.to_string(),
+                finished: false,
+            };
+        }
+        assert!(!state.data.read().context_load_in_progress(uri));
+        assert!(state
+            .data
+            .read()
+            .context_errors
+            .get(uri)
+            .unwrap()
+            .contains("interrupted"));
+        assert!(state.data.write().begin_context_load(uri, false));
+    }
+
     #[tokio::test]
     async fn failed_connection_attempt_leaves_published_session_invalid() {
         let spotify = super::spotify::Spotify::new();

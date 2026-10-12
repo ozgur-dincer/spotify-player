@@ -439,9 +439,18 @@ pub fn render_context_page(
                 }
             }
         }
-        None => {
-            frame.render_widget(Paragraph::new("Loading..."), rect);
-        }
+        None => frame.render_widget(
+            Paragraph::new(data.context_errors.get(&id.uri()).map_or_else(
+                || "Loading...".to_string(),
+                |error| {
+                    format!(
+                        "Failed to load: {error}\nReopen this page to retry; press g o for logs."
+                    )
+                },
+            ))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+            rect,
+        ),
     }
 }
 

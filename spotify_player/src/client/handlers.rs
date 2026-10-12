@@ -58,6 +58,7 @@ pub async fn start_session_watcher(state: SharedState, client: super::AppClient)
         interval.tick().await;
         if let Err(err) = client.check_valid_session(&state).await {
             tracing::error!("Failed to check/reconnect the client's session: {err:#}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 }

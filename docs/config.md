@@ -381,3 +381,4 @@ target = "PlayingTrack"
 action="ToggleLiked"
 key_sequence="C-l"
 ```
+- Failed or cancelled session connections are retried automatically after transient network failures. Reconnection clears stale playback state; integrated-device selection checks session health before activation.

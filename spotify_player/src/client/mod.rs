@@ -38,6 +38,19 @@ pub use request::*;
 use serde::Deserialize;
 pub(crate) use spotify::{PkceWebApiClient, WebApiClient};
 
+struct SessionConnectionAttempt {
+    session: librespot_core::Session,
+    connected: bool,
+}
+
+impl Drop for SessionConnectionAttempt {
+    fn drop(&mut self) {
+        if !self.connected {
+            self.session.shutdown();
+        }
+    }
+}
+
 fn patch_missing_track_external_ids(response: &mut serde_json::Value) {
     let Some(item) = response.get_mut("item") else {
         return;
@@ -267,6 +280,11 @@ impl AppClient {
 
     /// Create a new client session
     pub async fn new_session(&self, state: Option<&SharedState>, reauth: bool) -> Result<()> {
+        let _reconnect = self.session_reconnect.lock().await;
+        self.connect_session(state, reauth).await
+    }
+
+    async fn connect_session(&self, state: Option<&SharedState>, reauth: bool) -> Result<()> {
         // Capture whether playback was active *before* tearing down any existing streaming
         // connection. Shutting down the old `librespot` spirc pauses playback Spotify-side
         // (and a broken session leaves it paused too), so we use this to resume on the new
@@ -282,6 +300,12 @@ impl AppClient {
 
         let session = self.auth_config.session();
         let creds = auth::get_creds(&self.auth_config, reauth, true).context("get credentials")?;
+        // An unconnected Session is not invalid by default. Keep failed/cancelled
+        // attempts retryable even after publishing their device ID.
+        let mut attempt = SessionConnectionAttempt {
+            session: session.clone(),
+            connected: false,
+        };
         self.spotify.set_session(session.clone()).await;
 
         #[allow(unused_mut)]
@@ -304,6 +328,12 @@ impl AppClient {
                 .await
                 .context("connect to a session")?;
         }
+        attempt.connected = true;
+        if let Some(state) = state {
+            let mut player = state.player.write();
+            player.buffered_playback = None;
+            player.playback = None;
+        }
 
         tracing::info!("Used a new session for Spotify client.");
 
@@ -325,7 +355,7 @@ impl AppClient {
         let _reconnect = self.session_reconnect.lock().await;
         if self.spotify.session().await.is_invalid() {
             tracing::info!("Client's current session is invalid, creating a new session...");
-            self.new_session(Some(state), false)
+            self.connect_session(Some(state), false)
                 .await
                 .context("create new client session")?;
         }
@@ -427,11 +457,18 @@ impl AppClient {
             #[allow(unused_mut)]
             let mut verify_integrated_playback = playback.is_none();
             #[cfg(feature = "streaming")]
-            if state.is_some_and(|state| state.is_streaming_enabled()) {
-                let device_id = self.spotify.session().await.device_id().to_string();
-                verify_integrated_playback |= playback
-                    .as_ref()
-                    .is_some_and(|p| p.device_id.as_deref() == Some(device_id.as_str()));
+            if let Some(state) = state.filter(|state| state.is_streaming_enabled()) {
+                let session = self.spotify.session().await;
+                let was_invalid = session.is_invalid();
+                self.check_valid_session(state).await?;
+                if was_invalid {
+                    playback = None;
+                    verify_integrated_playback = true;
+                } else {
+                    verify_integrated_playback |= playback
+                        .as_ref()
+                        .is_some_and(|p| p.device_id.as_deref() == Some(session.device_id()));
+                }
             }
             if verify_integrated_playback {
                 let device_id = self.integrated_device_id(state).await?;
@@ -461,6 +498,23 @@ impl AppClient {
             PlayerRequest::TransferPlayback(device_id, force_play) => {
                 // `TransferPlayback` needs to be handled separately from other player requests
                 // because `TransferPlayback` doesn't require an active playback
+                #[allow(unused_mut)]
+                let mut device_id = device_id;
+                #[cfg(feature = "streaming")]
+                if let Some(state) = state.filter(|state| state.is_streaming_enabled()) {
+                    let old_id = self.spotify.session().await.device_id().to_string();
+                    let is_integrated = device_id == old_id
+                        || state
+                            .player
+                            .read()
+                            .devices
+                            .iter()
+                            .any(|device| device.is_integrated && device.id == device_id);
+                    self.check_valid_session(state).await?;
+                    if is_integrated {
+                        device_id = self.spotify.session().await.device_id().to_string();
+                    }
+                }
                 self.transfer_playback_locally(&device_id, force_play)
                     .await?;
                 tracing::info!("Transferred playback to device with id={}", device_id);
@@ -641,6 +695,10 @@ impl AppClient {
                 self.retrieve_current_playback(state, true).await?;
             }
             ClientRequest::GetDevices => {
+                #[cfg(feature = "streaming")]
+                if state.is_streaming_enabled() {
+                    self.check_valid_session(state).await?;
+                }
                 #[allow(unused_mut)]
                 let mut devices: Vec<Device> = self
                     .available_devices()
@@ -2271,6 +2329,55 @@ fn move_seed_track_to_front(tracks: &mut Vec<Track>, seed_track: Track) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn failed_connection_attempt_leaves_published_session_invalid() {
+        let spotify = super::spotify::Spotify::new();
+        let session =
+            librespot_core::Session::new(librespot_core::config::SessionConfig::default(), None);
+        spotify.set_session(session.clone()).await;
+        {
+            let _attempt = super::SessionConnectionAttempt {
+                session,
+                connected: false,
+            };
+        }
+        assert!(spotify.session().await.is_invalid());
+    }
+
+    #[tokio::test]
+    async fn cancelled_connection_attempt_leaves_session_retryable() {
+        let session =
+            librespot_core::Session::new(librespot_core::config::SessionConfig::default(), None);
+        let candidate = session.clone();
+        let mut connecting = Box::pin(async move {
+            let _attempt = super::SessionConnectionAttempt {
+                session: candidate,
+                connected: false,
+            };
+            std::future::pending::<()>().await;
+        });
+        tokio::select! {
+            () = &mut connecting => panic!("connection unexpectedly completed"),
+            () = tokio::task::yield_now() => {}
+        }
+        drop(connecting);
+        assert!(session.is_invalid());
+    }
+
+    #[tokio::test]
+    async fn completed_connection_attempt_keeps_session_valid() {
+        let session =
+            librespot_core::Session::new(librespot_core::config::SessionConfig::default(), None);
+        {
+            let mut attempt = super::SessionConnectionAttempt {
+                session: session.clone(),
+                connected: false,
+            };
+            attempt.connected = true;
+        }
+        assert!(!session.is_invalid());
+    }
+
     use super::{
         move_seed_track_to_front, parse_current_playback_response, spotify, AppClient,
         PlayerRequest, WebApiClient,

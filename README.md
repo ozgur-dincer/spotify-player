@@ -277,6 +277,8 @@ With streaming enabled, startup and session reconnection also activate this inst
 
 If the integrated Spotify Connect task stops, the app automatically reconnects its session instead of leaving an unavailable device registered locally.
 
+Failed or cancelled connection attempts remain retryable, including temporary DNS/network failures after sleep. Reconnection clears stale playback metadata, and selecting the integrated device checks the session before activating it.
+
 Unexpected pauses of the integrated player are automatically undone, like unsolicited volume changes. Local TUI/CLI controls and OS media keys can still pause playback, as can `pause_on_startup` and shutdown. Librespot reports pauses after they happen without identifying the sender, so undoing a remote pause may cause a brief interruption.
 
 #### Audio backend

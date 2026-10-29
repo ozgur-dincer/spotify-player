@@ -73,6 +73,33 @@ fn open_current_log(
         .context("open current log for appending")
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)] // dup2 has no safe std equivalent
+fn redirect_stderr(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: both descriptors are valid; dup2 only repoints fd 2 at the log file.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        tracing::warn!("Failed to redirect stderr to the log file");
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)] // SetStdHandle has no safe std equivalent
+fn redirect_stderr(file: &std::fs::File) {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+
+    // The duplicated handle is intentionally leaked: it must stay valid for the
+    // lifetime of the process as the new stderr.
+    if let Ok(dup) = file.try_clone() {
+        let handle = dup.into_raw_handle();
+        // SAFETY: `handle` is a valid, owned file handle.
+        if unsafe { SetStdHandle(STD_ERROR_HANDLE, handle.cast()) } == 0 {
+            tracing::warn!("Failed to redirect stderr to the log file");
+        }
+    }
+}
+
 fn init_logging(
     log_folder: &std::path::Path,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
@@ -96,7 +123,9 @@ fn init_logging(
         std::fs::create_dir_all(log_folder)?;
     }
     let log_file = open_current_log(log_folder, chrono::Local::now())?;
-
+    // Third-party crates (e.g. the audio backend) print errors to stderr, which
+    // would corrupt the TUI, so route them to the log file instead.
+    redirect_stderr(&log_file);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_writer(std::sync::Mutex::new(log_file));

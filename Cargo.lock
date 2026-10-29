@@ -5733,6 +5733,7 @@ dependencies = [
  "html-escape",
  "http",
  "image",
+ "libc",
  "librespot-connect",
  "librespot-core",
  "librespot-metadata",
@@ -5764,6 +5765,7 @@ dependencies = [
  "vergen",
  "which 8.0.6",
  "windows 0.58.0",
+ "windows-sys 0.59.0",
  "winit",
  "wiremock",
 ]

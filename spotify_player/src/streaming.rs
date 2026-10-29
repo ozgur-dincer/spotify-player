@@ -4,7 +4,7 @@ use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::DeviceType;
 use librespot_core::{spotify_uri, Session, SpotifyUri};
-use librespot_playback::audio_backend::Sink;
+use librespot_playback::audio_backend::{Sink, SinkResult};
 use librespot_playback::mixer::MixerConfig;
 use librespot_playback::{
     audio_backend,
@@ -12,11 +12,13 @@ use librespot_playback::{
     mixer::{self, Mixer},
     player,
 };
+use librespot_playback::{convert::Converter, decoder::AudioPacket};
 use parking_lot::Mutex;
 use rspotify::model::{EpisodeId, Id, PlayableId, TrackId};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 /// Whether the next streaming connection is the first one of the process.
 ///
@@ -106,6 +108,133 @@ impl StreamingConnection {
             .context("shut down integrated player")?;
         guard.reset();
         guard.shutting_down = true;
+        Ok(())
+    }
+}
+
+type SinkFactory = Arc<dyn Fn() -> Box<dyn Sink> + Send + Sync>;
+
+/// Max time to wait for the inner sink before considering its output device dead.
+const SINK_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+enum SinkCommand {
+    Start,
+    Stop,
+    Write(AudioPacket),
+}
+
+/// Handle to a sink living on its own thread, so that a call stuck on a dead
+/// output device can be abandoned instead of blocking the librespot player thread.
+struct SinkWorker {
+    commands: mpsc::Sender<SinkCommand>,
+    results: mpsc::Receiver<SinkResult<()>>,
+}
+
+impl SinkWorker {
+    fn spawn(factory: SinkFactory) -> Self {
+        let (commands, command_rx) = mpsc::channel::<SinkCommand>();
+        let (result_tx, results) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sink = factory();
+            // Only used for f32 conversion by sample-based backends, which ignores dither.
+            let mut converter = Converter::new(None);
+            while let Ok(command) = command_rx.recv() {
+                let result = match command {
+                    SinkCommand::Start => sink.start(),
+                    SinkCommand::Stop => sink.stop(),
+                    SinkCommand::Write(packet) => sink.write(packet, &mut converter),
+                };
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { commands, results }
+    }
+
+    /// Returns `None` if the sink thread is stuck or gone.
+    fn call(&self, command: SinkCommand) -> Option<SinkResult<()>> {
+        self.commands.send(command).ok()?;
+        self.results.recv_timeout(SINK_CALL_TIMEOUT).ok()
+    }
+}
+
+/// A sink that opens the audio backend on the current default output device on
+/// every start, and recovers when the device disappears.
+///
+/// Backends such as rodio bind to the default output device when created and
+/// block forever once it disconnects (e.g. a Bluetooth headset), which would
+/// also freeze the player thread. A stuck sink is abandoned and rebuilt.
+struct ReopenSink {
+    factory: SinkFactory,
+    worker: Option<SinkWorker>,
+    started: bool,
+}
+
+impl ReopenSink {
+    fn new(factory: SinkFactory) -> Self {
+        Self {
+            factory,
+            worker: None,
+            started: false,
+        }
+    }
+
+    fn open(&mut self) -> &SinkWorker {
+        tracing::debug!("Opening the audio sink on the current default output device");
+        self.worker
+            .insert(SinkWorker::spawn(Arc::clone(&self.factory)))
+    }
+}
+
+impl Sink for ReopenSink {
+    fn start(&mut self) -> SinkResult<()> {
+        self.started = true;
+        // Dropping the previous worker releases its device handle.
+        self.worker = None;
+        if let Some(result) = self.open().call(SinkCommand::Start) {
+            return result;
+        }
+        tracing::warn!("Timed out starting the audio sink");
+        self.worker = None;
+        Ok(())
+    }
+
+    fn stop(&mut self) -> SinkResult<()> {
+        self.started = false;
+        if let Some(worker) = &self.worker {
+            if let Some(result) = worker.call(SinkCommand::Stop) {
+                return result;
+            }
+            tracing::warn!("Audio sink is unresponsive, the output device may have disconnected");
+            self.worker = None;
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+        let pace = packet
+            .samples()
+            .map(|samples| Duration::from_secs_f64(samples.len() as f64 / 2.0 / 44_100.0))
+            .unwrap_or_default();
+
+        if self.worker.is_none() {
+            let started = self.started;
+            let worker = self.open();
+            if started && worker.call(SinkCommand::Start).is_none() {
+                self.worker = None;
+            }
+        }
+
+        if let Some(worker) = &self.worker {
+            if let Some(result) = worker.call(SinkCommand::Write(packet)) {
+                return result;
+            }
+            tracing::warn!("Audio sink is unresponsive, the output device may have disconnected");
+            self.worker = None;
+        }
+        // Keep the player decoding at real-time speed while no output is available.
+        std::thread::sleep(pace);
         Ok(())
     }
 }
@@ -308,18 +437,20 @@ pub async fn new_connection(
             session.clone(),
             mixer.get_soft_volume(),
             move || -> Box<dyn Sink> {
-                let real = backend(None, AudioFormat::default());
-                if let Some(ref bands) = vis_bands {
-                    Box::new(crate::ui::streaming::VisualizationSink::new(
-                        real,
-                        Arc::clone(bands),
-                        // librespot defaults to 44100 Hz; adjust here if
-                        // PlayerConfig::sample_rate is changed in the future.
-                        44_100.0,
-                    ))
-                } else {
-                    real
-                }
+                Box::new(ReopenSink::new(Arc::new(move || -> Box<dyn Sink> {
+                    let real = backend(None, AudioFormat::default());
+                    if let Some(ref bands) = vis_bands {
+                        Box::new(crate::ui::streaming::VisualizationSink::new(
+                            real,
+                            Arc::clone(bands),
+                            // librespot defaults to 44100 Hz; adjust here if
+                            // PlayerConfig::sample_rate is changed in the future.
+                            44_100.0,
+                        ))
+                    } else {
+                        real
+                    }
+                })))
             },
         )
     };

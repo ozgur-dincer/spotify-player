@@ -76,8 +76,12 @@ wiremock = "0.6.5"
 version = "0.30.13"
 optional = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 clipboard-win = "5.4.1"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.58.0"
